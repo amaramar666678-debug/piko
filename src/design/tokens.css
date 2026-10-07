@@ -1,0 +1,276 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   Design tokens — the island's single source of truth.
+
+   Everything visual the island paints comes from here: colour, radii, shadows,
+   spacing, the type scale and the motion timings. Nothing in `style.css` is
+   allowed to invent a hex value or an alpha any more; if a shade is missing it
+   gets a name here first, so there is one place to change it.
+
+   Direction: elegant dark glass with a warm accent.
+
+   The island is a transparent always-on-top webview, so there is nothing behind
+   it for `backdrop-filter` to blur. "Glass" here therefore means layered
+   translucency *inside* the panel — a bezel gradient under two semi-transparent
+   cards, a 1px light catch along the top edge, and low-alpha fills so the layers
+   read through each other. Depth is built from light, not from blur.
+
+   Every colour the island *displays* rather than draws still comes from TypeScript
+   and is deliberately left alone: `botGlowColor()` and `washRGBA()` in
+   `core/layout.ts`. The state tokens below reuse their exact values so the CSS and
+   the canvas glow agree without either one moving.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+:root {
+  color-scheme: dark;
+
+  /* ── Type ────────────────────────────────────────────────────────────────── */
+
+  --font: system-ui, "Segoe UI Variable Text", "Segoe UI", "Segoe UI Emoji", sans-serif;
+  --mono: "Cascadia Mono", "Consolas", ui-monospace, monospace;
+
+  /* Two scales, both named by their own value rather than by a role. The island
+     has exactly one set of sizes and one clock, and a role name per step
+     (`--fs-sm`, `--fs-lg`) invents a hierarchy the numbers do not have: 11.5px
+     is not "smaller than 12px" in any way a person can see. Naming the value
+     makes a component's proportions readable straight off the rule. */
+
+  /* Type scale, in px. Half-steps are spelled out rather than rounded. */
+  --fs-2xs: 9px;
+  --fs-2xs2: 9.5px;
+  --fs-xs: 10px;
+  --fs-xs2: 10.5px;
+  --fs-sm: 11px;
+  --fs-sm2: 11.5px;
+  --fs-md: 12px;
+  --fs-base: 12.5px;
+  --fs-lg: 13px;
+  --fs-xl: 15px;
+  --fs-display: 20px;
+
+  --fw-normal: 400;
+  --fw-medium: 500;
+  --fw-semi: 600;
+  --fw-bold: 700;
+
+  /* ── Ink ─────────────────────────────────────────────────────────────────── */
+
+  /* Five steps and no more: the island is 640px wide, so a longer ramp only
+     produces two greys that look identical and one that looks like a mistake.
+
+     Ratios below are against the card (#14161e) and the pill fill (#0a0b0f), by
+     `npm run contrast`. The lower three were lifted because two of them failed
+     outright: --dim-4, the colour of an icon at rest, sat at 2.37:1, which is
+     below even the 3:1 that WCAG asks of a non-text mark. --dim-3 is body-adjacent
+     and now clears AA. --dim-5 is deliberately still quiet - it is a divider and a
+     ghost, not text, and a step that reads on a 640px panel is a step that competes
+     with the thing it is behind. */
+  --ink: #f2f3f7; /* primary text, and the fill of the primary button */
+  --ink-2: #dcdfe6; /* secondary text, button labels on glass */
+  --dim: #9aa0ac; /* body copy  6.88:1 */
+  --dim-2: #848a96; /* labels, secondary chrome  5.21:1 */
+  --dim-3: #7b8290; /* placeholders, timestamps  4.67:1 */
+  --dim-4: #666d7a; /* icons at rest, dividers  3.47:1 */
+  --dim-5: #565d6a; /* the quietest ink there is  2.72:1 */
+
+  /* Named once, used four times. It was referenced by `.pill.add:hover`,
+     `.agent-row`, `.kind-btn:hover` and `.agent-picker-done:hover` and never
+     defined, so all four silently inherited their parent's colour instead. */
+  --text: var(--ink);
+
+  /* ── Surfaces ────────────────────────────────────────────────────────────── */
+
+  /* The bezel. The island's own box, seen as a ~10px frame around the card, so it
+     is a gradient rather than a flat fill: a flat black there reads as a hard
+     edge cut out of the wallpaper. */
+  --bezel-top: #0b0c11;
+  --bezel-bottom: #14161d;
+
+  /* The cards. Translucent over the bezel, which is what lets the two overview
+     cards read as one pane with a seam rather than as two floating boxes. */
+  --glass-1: rgba(26, 29, 38, 0.78);
+  --glass-2: rgba(34, 38, 49, 0.78);
+
+  /* Anything sitting on a card: pills, rows, code, the composer. */
+  --surface-1: rgba(255, 255, 255, 0.045);
+  --surface-2: rgba(255, 255, 255, 0.075);
+  --surface-3: rgba(255, 255, 255, 0.11);
+  --surface-sunken: rgba(10, 11, 15, 0.45);
+
+  /* Kept as aliases: several rules were written against these two names. */
+  --card: var(--glass-1);
+  --card-flat: var(--surface-sunken);
+
+  /* ── Light ───────────────────────────────────────────────────────────────── */
+
+  /* The warm accent. One accent for the whole island: the selected tab, the
+     focus ring, the empty "+" and the progress fill all read as the same
+     material. It is the only saturated warm thing here, which is what keeps the
+     green/amber/red state colours unambiguous. */
+  --accent: #f5a86a;
+  --accent-bright: #ffc294;
+  --accent-deep: #d97f42;
+  --accent-wash: rgba(245, 168, 106, 0.14);
+  --accent-line: rgba(245, 168, 106, 0.42);
+  --accent-glow: rgba(245, 168, 106, 0.28);
+
+  /* The light catch on the primary button. The button is the island's brightest
+     surface, and a pure-white top edge next to the warm bezel below reads as a
+     sticker; a few degrees of cream reads as the same material, lit. */
+  --ink-warm: #fffdfa;
+  --sheen: rgba(255, 214, 176, 0.07);
+
+  /* Alpha ramp. Every "rgba(255,255,255,…)" in the stylesheet was one of these
+     nine values; naming them is the difference between a legible palette and a
+     hundred and three literals. */
+  --a-05: rgba(255, 255, 255, 0.05);
+  --a-07: rgba(255, 255, 255, 0.07);
+  --a-09: rgba(255, 255, 255, 0.09);
+  --a-12: rgba(255, 255, 255, 0.12);
+  --a-16: rgba(255, 255, 255, 0.16);
+  --a-20: rgba(255, 255, 255, 0.2);
+  --a-22: rgba(255, 255, 255, 0.22);
+  --a-30: rgba(255, 255, 255, 0.3);
+  --a-45: rgba(255, 255, 255, 0.45);
+  --a-75: rgba(255, 255, 255, 0.75);
+
+  /* The warm counterpart of --a-07, for surfaces that should feel lit rather
+     than merely present. */
+  --a-warm: rgba(255, 205, 160, 0.08);
+
+  --hairline: var(--a-07);
+  --line-strong: var(--a-16);
+
+  /* ── State ───────────────────────────────────────────────────────────────── */
+
+  /* Identical to `botGlowColor()` in core/layout.ts. The canvas glow and the CSS
+     around it must be the same colour or the character stops belonging to the
+     panel it is sitting in — these are the two halves of one decision, so they
+     are written down together here and nowhere else. */
+  --state-finished: #34d399;
+
+  /* Softer twins, for text and fills rather than for a glow. */
+  --green: #34d399;
+  --green-2: #34d399;
+  --red: #f4505e;
+  --red-text: #ff8d97;
+  --red-wash: rgba(244, 80, 94, 0.16);
+  --amber: #f5a524;
+
+  /* The one place the canvas gets its state palette from.
+     `botGlowColor()` in core/layout.ts is the authority for what colour a state
+     *is* — it is TypeScript, it is what actually reaches the canvas, and it is
+     deliberately not duplicated here as a set of tokens. The two halves drifted
+     once already; a second copy of the same eight hex values would only give the
+     drift somewhere new to happen. `--state-finished` is the sole exception: it
+     is the green the upload bar finishes on, so CSS has to name it. */
+  --state-finished: #34d399;
+
+  /* Translucent state fills, for washes and for the drop zone going live. */
+  --green-wash: rgba(52, 211, 153, 0.14);
+  --green-wash-strong: rgba(52, 211, 153, 0.28);
+  --green-line: rgba(34, 197, 94, 0.65);
+  --green-line-soft: rgba(34, 197, 94, 0.13);
+  --green-glow: rgba(110, 231, 183, 0.45);
+  --indigo-wash: rgba(99, 102, 241, 0.28);
+  --indigo-soft: rgba(99, 102, 241, 0.24);
+  --indigo-line: rgba(129, 140, 248, 0.7);
+  --indigo-line-soft: rgba(129, 140, 248, 0.6);
+  --indigo-link: #7c5cffd9;
+
+  /* Ink for anything drawn on top of a light fill — the primary button's label and
+     the hairline around its shortcut. Warm-black rather than pure black so it sits
+     on the button's own tint instead of punching a hole in it. */
+  --on-primary: #14151a;
+  --on-primary-line: rgba(20, 21, 26, 0.4);
+
+  /* ── Accents that belong to one card, not to a state ─────────────────────── */
+
+  /* The upload progress bar runs dark-to-light along its length, so it needs a
+     deeper green than `--state-finished` to start from. */
+  --green-deep: #1fa87a;
+
+  /* Cal.com and the integration timestamps are warm browns; they are a brand
+     colour, kept apart from the state reds and ambers on purpose. */
+  --sand: #c9956a;
+
+  /* Links inside an integration card. A link has to read as pressable without
+     competing with the row it sits in. */
+  --indigo-link: #7c5cffd9;
+
+  /* The context chip's dot: a full spectrum, because it stands for "whatever this
+     question is about" and any single hue would claim to mean something. */
+  --chip-spectrum: linear-gradient(135deg, #ff6b5b, #f7b32b, #2dd4a7, #38bdf8, #a78bfa);
+
+  /* The ticker's shimmer sweep, dim end to bright end. */
+  --shimmer-dim: #7c818a;
+  --shimmer-bright: #f2f3f5;
+
+  /* ── Radii ───────────────────────────────────────────────────────────────── */
+
+  /* Named in px. `.card` cannot exceed the island's own corner, which
+     `applyGeometry()` overwrites every frame from EXPANDED_CORNER = 22 in
+     core/layout.ts — `--r-card` sits just under it on purpose, because a card
+     radius above that would be clipped rather than rounded. */
+  --r-2: 2px;
+  --r-3: 3px;
+  --r-4: 4px;
+  --r-5: 5px;
+  --r-6: 6px;
+  --r-8: 8px;
+  --r-9: 9px;
+  --r-10: 10px;
+  --r-12: 12px;
+  --r-13: 13px;
+  --r-card: 20px;
+  --r-pill: 999px;
+  --r-full: 50%;
+
+  /* ── Shadows ─────────────────────────────────────────────────────────────── */
+
+  /* Glass needs a shadow with a colour, not just an offset: a black shadow on a
+     near-black panel is invisible, so these carry a warm lift as well as depth. */
+  --shadow-1: 0 2px 10px rgba(0, 0, 0, 0.45);
+  --shadow-2: 0 12px 32px -12px rgba(0, 0, 0, 0.75);
+  --shadow-3: 0 24px 60px -20px rgba(0, 0, 0, 0.85);
+
+  /* The light catch along a top edge. Inset, 1px, warm — this single line is
+     what separates "a dark box" from "a pane of glass". */
+  --edge-glass: inset 0 1px 0 var(--sheen), inset 0 0 0 1px var(--a-07);
+
+  --focus-ring: 0 0 0 2px var(--accent-line);
+
+  /* ── Spacing ─────────────────────────────────────────────────────────────── */
+
+  /* The four gaps the shell is built from. Everything inside a card positions
+     itself relative to the character or to a card edge — those are offsets
+     reserved by the bot's x/y in `VIEW_LAYOUTS`, not a rhythm, and they stay as
+     literals in the stylesheet. */
+  --s-3: 3px;
+  --s-4: 4px;
+  --s-5: 5px;
+  --s-6: 6px;
+  --s-8: 8px;
+  --s-10: 10px;
+  --s-14: 14px;
+
+  /* ── Motion ──────────────────────────────────────────────────────────────── */
+
+  /* Named in milliseconds. The durations were already consistent; they are named
+     so the clock lives beside the colours instead of being retyped per rule.
+     The loop animations (shimmer, marching dashes, pulse) keep their own literals
+     in the stylesheet — they are per-effect, not a shared timing. */
+  --dur-80: 0.08s;
+  --dur-120: 0.12s;
+  --dur-140: 0.14s;
+  --dur-160: 0.16s;
+  --dur-180: 0.18s;
+  --dur-200: 0.2s;
+  --dur-220: 0.22s;
+  --dur-250: 0.25s;
+  --dur-280: 0.28s;
+  --dur-300: 0.3s;
+  --dur-400: 0.4s;
+  --dur-450: 0.45s;
+
+  --ease-spring: cubic-bezier(0.3, 1.2, 0.4, 1);
+}

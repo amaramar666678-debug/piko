@@ -1,0 +1,804 @@
+// Island views — DOM ports of IslandViewContent.swift. Paddings, font sizes,
+// colours and wording are copied from the Swift views so both platforms read
+// identically.
+
+import { h, svg, clear, dot } from "./dom";
+import { ICONS } from "./icons";
+import { Ticker } from "./ticker";
+import {
+  INTEGRATION_AGENTS, MAX_ACTIVE_INTEGRATIONS,
+  State, type AgentTask,
+} from "../core/state";
+import { Bridge } from "../core/bridge";
+import { washRGBA, type IslandViewName, type Wash } from "../core/layout";
+import { createMiniBot, pruneMiniBots } from "../piko/minibots";
+import { buildPrompt } from "./chat";
+import { buildTaskList } from "./tasks";
+import { buildChoose, buildUpload, buildUploading } from "./upload";
+import { renderIntegrationCard, type IntegrationCardHooks } from "./integrations";
+
+export interface ViewActions {
+  setView(v: IslandViewName): void;
+  collapse(): void;
+  setFocus(id: string): void;
+  openTerminal(): void;
+  /** The â†— button: opens whatever the focused pill points at. */
+  openTarget(): void;
+  openUrl(url: string): void;
+  decide(d: "allow" | "deny"): void;
+  /** The MCP card's buttons. `session` is the "for this session" tick. */
+  mcpAnswer(allow: boolean, session: boolean): void;
+  toggleSound(): void;
+  setVolume(v: number): void;
+  setAutoClose(seconds: number): void;
+  openSettingsWindow(): void;
+  blip(): void;
+}
+
+export interface ViewHost {
+  el: HTMLElement;
+  sync(): void;
+  /** Called when the view becomes active, for views with a text field. */
+  focus?(): void;
+  /** Called every frame while the view is on screen. */
+  tick?(nowMs: number): void;
+}
+
+// ── Shared pieces ─────────────────────────────────────────────────────────────
+
+function card(wash: Wash, ...children: (Node | string)[]): HTMLElement {
+  const el = h("div", { class: wash ? "card wash" : "card" }, ...children);
+  if (wash) el.style.setProperty("--wash", washRGBA(wash));
+  return el;
+}
+
+function btn(
+  label: string,
+  kind: "primary" | "secondary",
+  onClick: () => void,
+  kbd?: string,
+): HTMLElement {
+  return h(
+    "button",
+    { class: `btn ${kind}`, onclick: onClick },
+    h("span", { text: label }),
+    kbd ? h("span", { class: "kbd", text: kbd }) : null,
+  );
+}
+
+/** AgentWho — coloured dot + task name + grey label. */
+function agentWho(task: AgentTask | null, label: string): HTMLElement {
+  const row = h("div", { class: "who-row" });
+  if (task) {
+    row.append(dot(task.color, 8), h("span", { class: "n", text: task.name }));
+  }
+  row.append(h("span", { text: label }));
+  return row;
+}
+
+function stack(padLeft: number, padRight: number, ...children: Node[]): HTMLElement {
+  const el = h("div", { class: "stack" }, ...children);
+  el.style.padding = `4px ${padRight}px 4px ${padLeft}px`;
+  return el;
+}
+
+// ── Header ────────────────────────────────────────────────────────────────────
+
+export function buildHeader(actions: ViewActions): ViewHost {
+  // Sizes are named rather than inline literals so the header's proportions can be
+// adjusted in one place. The tabs were 13 and the gear 14, which at the island's
+// real height read as specks; both are a touch larger now.
+const TAB_ICON = 15;
+const ACTION_ICON = 16;
+
+const tabHome = h("button", { class: "tab", title: "Overview", onclick: () => go("overview") }, svg(ICONS.house, TAB_ICON));
+  const tabChat = h("button", { class: "tab", title: "Ask", onclick: () => go("prompt") }, svg(ICONS.bubble, TAB_ICON));
+  const tabDrop = h("button", { class: "tab", title: "Drop", onclick: () => go("upload") }, svg(ICONS.plus, TAB_ICON));
+
+  const gearBtn = h("button", { title: "Settings", onclick: () => go("settings") }, svg(ICONS.sliders, ACTION_ICON));
+  const soundBtn = h("button", { title: "Mute", onclick: () => actions.toggleSound() }, svg(ICONS.speakerOn, ACTION_ICON));
+
+  function go(v: IslandViewName) {
+    actions.blip();
+    actions.setView(v);
+  }
+
+  const el = h(
+    "div",
+    { id: "header" },
+    h("div", { class: "tabs" }, tabHome, tabChat, tabDrop),
+    h("div", { class: "header-actions" }, gearBtn, soundBtn),
+  );
+
+  return {
+    el,
+    sync() {
+      const v = State.view;
+      tabHome.classList.toggle("on", v === "overview" || v === "empty");
+      tabChat.classList.toggle("on", v === "prompt");
+      tabDrop.classList.toggle("on", v === "upload");
+      gearBtn.classList.toggle("on", v === "settings");
+      clear(gearBtn);
+      gearBtn.append(svg(v === "settings" ? ICONS.slidersFill : ICONS.sliders, ACTION_ICON));
+      clear(soundBtn);
+      soundBtn.append(svg(State.settings.soundEnabled ? ICONS.speakerOn : ICONS.speakerOff, ACTION_ICON));
+      el.style.opacity = v === "confused" ? "0" : "1";
+    },
+  };
+}
+
+// ── Overview ──────────────────────────────────────────────────────────────────
+
+function buildOverview(actions: ViewActions, onHeightChange: () => void): ViewHost {
+  const ticker = new Ticker();
+  const who = h("div", { class: "who" });
+  const tickerBody = h("div", { class: "card-body" }, who, ticker.el);
+  const leftBody = h("div", { class: "left-body" });
+  const jump = h(
+    "button",
+    { class: "icon-btn jump", title: "Open", onclick: () => actions.openTarget() },
+    svg(ICONS.arrowUpRight, 8),
+  );
+  const left = card(null, leftBody, jump);
+  const pills = h("div", { class: "pills" });
+  // The 2×2 grid and the "+" are siblings, not grid items: a fifth child would
+  // spill onto a third row and be clipped by the card.
+  const pillGrid = h("div", { class: "pill-grid" });
+  pills.append(pillGrid);
+  // Real sessions started from the island. Sits under the integration pills so
+  // the existing layout is untouched when there are none.
+  const tasks = buildTaskList(
+    {
+      abort: (id) => {
+        void Bridge.taskAbort(id).catch((err) => {
+          State.noteMessage = String(err).replace(/^Error:\s*/, "");
+          State.view = "note";
+          State.notify();
+        });
+      },
+      open: (id) => void Bridge.taskOpen(id),
+      followup: (id, text) => {
+        void Bridge.taskFollowup(id, text).catch((err) => {
+          State.noteMessage = String(err).replace(/^Error:\s*/, "");
+          State.view = "note";
+          State.notify();
+        });
+      },
+      complain: (message) => {
+        State.noteMessage = message;
+        State.view = "note";
+        State.notify();
+      },
+    },
+    onHeightChange,
+  );
+  const right = card(null, pills, buildMcpIndicator(actions).el, tasks.el);
+
+  const el = h("div", { class: "view overview" },
+    h("div", { class: "left" }, left),
+    h("div", { class: "right" }, right),
+  );
+
+  let pillIds = "";
+  let detailOpen = false;
+  let lastFocus: string | null = null;
+  let mode: "ticker" | "card" | null = null;
+  let cardKey = "";
+
+  const hooks: IntegrationCardHooks = {
+    get detailOpen() {
+      return detailOpen;
+    },
+    openDetail() {
+      detailOpen = true;
+      cardKey = "";
+      State.notify();
+    },
+    closeDetail() {
+      detailOpen = false;
+      cardKey = "";
+      State.notify();
+    },
+    openSettings: () => actions.openSettingsWindow(),
+  };
+
+  return {
+    el,
+    tick(nowMs: number) {
+      if (mode === "ticker") ticker.tick(nowMs);
+    },
+    sync() {
+      const task = State.focusTask;
+      if (task?.id !== lastFocus) {
+        lastFocus = task?.id ?? null;
+        detailOpen = false;
+        cardKey = "";
+        mode = null;
+      }
+
+      // VS Code with a live Claude Code session keeps the ticker; every other
+      // pill shows its own card, exactly like IntegrationCardView.
+      const sessionActive =
+        task?.id === "integration_claude" && (task.state !== "idle" || task.steps.length > 0);
+
+      if (task && sessionActive) {
+        if (mode !== "ticker") {
+          clear(leftBody);
+          leftBody.append(tickerBody);
+          mode = "ticker";
+          cardKey = "";
+        }
+        clear(who);
+        who.append(
+          dot(task.color, 7),
+          h("span", { class: "name", text: task.name }),
+          h("span", { class: "tool", text: task.source === "claudeCode" ? "Claude Code" : "n8n" }),
+        );
+        if (task.steps.length > 1) {
+          who.append(h("span", {
+            class: "count",
+            text: `${Math.min(task.stepIndex + 1, task.steps.length)}/${task.steps.length}`,
+          }));
+        }
+        ticker.sync(task);
+      } else if (task) {
+        const info = State.integrations[task.id];
+        const key = [
+          task.id, detailOpen, task.state, task.steps.join("|"),
+          info?.loaded, info?.error, info?.configured,
+          JSON.stringify(info?.data ?? {}),
+        ].join("~");
+        if (key !== cardKey) {
+          cardKey = key;
+          mode = "card";
+          clear(leftBody);
+          leftBody.append(renderIntegrationCard(task, hooks));
+        }
+      }
+
+      jump.style.display = detailOpen ? "none" : "";
+
+      const others = State.otherTasks.slice(0, MAX_ACTIVE_INTEGRATIONS);
+      const pillKey =
+        others.map((t) => `${t.id}:${t.pillBadge ?? ""}`).join("|") +
+        `#${State.settings.activeIntegrations.join(",")}` +
+        `#${State.noteMessage ?? ""}`;
+      if (pillKey !== pillIds) {
+        pillIds = pillKey;
+        clear(pillGrid);
+        for (const t of others) pillGrid.append(buildPill(t, actions));
+        pills.append(buildAgentPicker());
+        pruneMiniBots();
+      }
+    },
+  };
+}
+
+/**
+ * The "+" at the end of the agent row: adds another agent to the island.
+ *
+ * Long-press, or right-click, a pill to take it away again — the row has room for
+ * four, so removing one is the only way to make space and it should not need a
+ * trip to Settings.
+ */
+function buildAgentPicker(): HTMLElement {
+  const room = MAX_ACTIVE_INTEGRATIONS - State.settings.activeIntegrations.length;
+  const btn = h(
+    "button",
+    {
+      class: "pill add",
+      title: room > 0 ? "Add an agent" : `The row holds ${MAX_ACTIVE_INTEGRATIONS}`,
+      "aria-label": "Add an agent",
+    },
+    svg(ICONS.plus, 13),
+  );
+
+  const openPicker = (e: MouseEvent) => {
+    e.stopPropagation();
+    if (room <= 0) {
+      State.noteMessage = `The row already holds ${MAX_ACTIVE_INTEGRATIONS} agents. Long-press one to remove it.`;
+      State.view = "note";
+      State.notify();
+      return;
+    }
+    AgentPicker.open(btn);
+  };
+
+  btn.addEventListener("click", openPicker);
+  btn.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    openPicker(e);
+  });
+  btn.style.opacity = room > 0 ? "1" : "0.5";
+  return btn;
+}
+
+/**
+ * The little list that drops out of the "+": the integrations that are not in the
+ * row yet, each with the key it needs.
+ */
+const AgentPicker = {
+  open(anchor: HTMLElement) {
+    close();
+    const available = INTEGRATION_AGENTS.filter(
+      (t) => t.id !== "integration_claude" &&
+        !State.settings.activeIntegrations.includes(t.id),
+    );
+    if (available.length === 0) {
+      State.noteMessage = "Every agent is already in the row.";
+      State.view = "note";
+      State.notify();
+      return;
+    }
+
+    const menu = h("div", { class: "agent-menu" });
+    for (const t of available) {
+      const row = h(
+        "button",
+        { class: "agent-row", title: `Add ${t.name}` },
+        h("i", { style: `background:${t.color}` }),
+        h("span", { text: t.name }),
+      );
+      row.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        const added = await State.toggleIntegration(t.id);
+        if (!added) {
+          State.noteMessage = `The row already holds ${MAX_ACTIVE_INTEGRATIONS} agents.`;
+          State.view = "note";
+        }
+        State.notify();
+        close();
+      });
+      menu.append(row);
+    }
+    menu.addEventListener("mousedown", (e) => e.stopPropagation());
+
+    document.body.append(menu);
+    const r = anchor.getBoundingClientRect();
+    menu.style.left = `${Math.round(r.left)}px`;
+    menu.style.top = `${Math.round(r.bottom + 4)}px`;
+
+    // Any click anywhere else closes it. `capture` so it runs before the island's
+    // own background handler turns the click into a collapse.
+    const dismiss = () => close();
+    document.addEventListener("mousedown", dismiss, true);
+
+    function close() {
+      menu.remove();
+      document.removeEventListener("mousedown", dismiss, true);
+    }
+  },
+};
+
+/** Long-press a pill to take that agent out of the row. */
+function wirePillRemoval(pill: HTMLElement, task: AgentTask) {
+  let timer: number | null = null;
+  const start = () => {
+    timer = window.setTimeout(() => {
+      timer = null;
+      void State.toggleIntegration(task.id);
+    }, 550);
+  };
+  const cancel = () => {
+    if (timer != null) window.clearTimeout(timer);
+    timer = null;
+  };
+  pill.addEventListener("pointerdown", start);
+  pill.addEventListener("pointerup", cancel);
+  pill.addEventListener("pointerleave", cancel);
+  pill.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    cancel();
+    void State.toggleIntegration(task.id);
+  });
+}
+
+function buildPill(task: AgentTask, actions: ViewActions): HTMLElement {
+  const label = task.id === "integration_claude" ? "VS Code" : task.name;
+  const canvas = createMiniBot(task, 24);
+  const pill = h(
+    "div",
+    { class: "pill", onclick: () => actions.setFocus(task.id) },
+    canvas,
+    h("span", { class: "lbl", text: label }),
+  );
+  pill.style.borderColor = `${task.color}24`;
+  if (task.id !== "integration_claude") wirePillRemoval(pill, task);
+  pill.addEventListener("mouseenter", () => {
+    pill.style.background = `${task.color}2e`;
+    pill.style.borderColor = `${task.color}8c`;
+    pill.style.boxShadow = `0 2px 10px ${task.color}59`;
+    (pill.querySelector(".lbl") as HTMLElement).style.color = lighten(task.color, 0.3);
+  });
+  pill.addEventListener("mouseleave", () => {
+    pill.style.background = "";
+    pill.style.borderColor = `${task.color}24`;
+    pill.style.boxShadow = "";
+    (pill.querySelector(".lbl") as HTMLElement).style.color = "";
+  });
+
+  if (task.pillBadge) {
+    const colors = { approval: "#F5A524", finished: "#22C55E", error: "#F4505E" } as const;
+    const icons = { approval: ICONS.bang, finished: ICONS.check, error: ICONS.xmark } as const;
+    const inner = h("i", { style: `background:${colors[task.pillBadge]}` }, svg(icons[task.pillBadge], 6, { stroke: task.pillBadge === "finished" ? 3 : 0 }));
+    const badge = h("div", { class: "pill-badge" }, inner);
+    badge.style.boxShadow = `0 0 4px ${colors[task.pillBadge]}99`;
+    pill.append(badge);
+  }
+  return pill;
+}
+
+function lighten(hex: string, amount: number): string {
+  const v = parseInt(hex.replace("#", ""), 16);
+  const c = [(v >> 16) & 255, (v >> 8) & 255, v & 255].map((x) =>
+    Math.min(255, Math.round(x + amount * 255)),
+  );
+  return `rgb(${c[0]},${c[1]},${c[2]})`;
+}
+
+// ── Empty ─────────────────────────────────────────────────────────────────────
+
+function buildEmpty(actions: ViewActions): ViewHost {
+  const body = h(
+    "div",
+    { class: "stack", style: "padding:0 18px 0 118px;flex-direction:row;align-items:center;gap:16px" },
+    h(
+      "div",
+      { style: "display:flex;flex-direction:column;gap:5px" },
+      h("div", { class: "title", text: "Nothing running right now." }),
+      h("div", { class: "sub", text: "Drop a file or window, or ask me anything." }),
+    ),
+    h("div", { class: "grow" }),
+    btn("Ask Claude", "primary", () => actions.setView("prompt")),
+  );
+  return { el: h("div", { class: "view" }, card(null, body)), sync() {} };
+}
+
+// ── MCP indicator ──────────────────────────────────────────────────────────────
+
+/**
+ * The always-there answer to "can an agent move my mouse right now?".
+ *
+ * It is a *view* of `State.mcp`, which Rust owns. The island has no opinion of
+ * its own and no local copy that could drift: if this says off, it is off, even
+ * if some other part of the webview thought otherwise. Hidden entirely when
+ * input control is off and nothing is waiting, because a permanent grey badge
+ * would be noise.
+ */
+function buildMcpIndicator(actions: ViewActions): ViewHost {
+  const el = h("div", { class: "mcp-indicator" });
+  let key = "";
+  return {
+    el,
+    sync() {
+      const { enabled, awaiting, registered, killHint } = State.mcp;
+      if (!enabled && !awaiting) {
+        el.style.display = "none";
+        key = "";
+        return;
+      }
+      el.style.display = "";
+      const label = enabled ? "Screen control on" : "Screen control off";
+      // The chord is part of the state: if another app took it, the row says so
+      // rather than pretending there is a kill switch.
+      const hotkey = State.mcpHotkeyFree
+        ? `${killHint} stops it`
+        : `${killHint} unavailable`;
+      const next = `${label}|${awaiting}|${registered}|${hotkey}`;
+      if (next === key) return;
+      key = next;
+      clear(el);
+      el.append(
+        dot(enabled ? "#F5A524" : "#6B7280", 6),
+        h("span", { class: "mcp-label", text: label }),
+        // Without the registration row the toggle does nothing, so say which it
+        // is rather than leaving the user to work it out.
+        h("span", {
+          class: "mcp-note",
+          text: registered ? hotkey : "not set up in OpenCode",
+        }),
+        btn(enabled ? "Stop" : "Off", "secondary", () => {
+          // Same command the chord runs, so the button and the hotkey cannot
+          // mean different things.
+          void Bridge.mcpKill().then((status) => {
+            if (status) State.setMcp(status);
+          });
+          actions.blip();
+        }),
+      );
+    },
+  };
+}
+
+// ── Approval ──────────────────────────────────────────────────────────────────
+
+function buildApproval(actions: ViewActions): ViewHost {
+  const who = h("div");
+  const from = h("div", { class: "approval-from" });
+  const code = h("div", { class: "code" });
+  const row = h("div", { class: "actions" });
+  const sessionRow = h("label", { class: "mcp-session" });
+  const sessionBox = h("input", { type: "checkbox" });
+  // "2 more waiting" — the person has to know answering this one is not the
+  // whole job, otherwise a queue of three looks like one request and they stop
+  // looking after the first Allow.
+  const more = h("div", { class: "approval-more" });
+  const el = h(
+    "div",
+    { class: "view" },
+    card("amber", stack(116, 16, who, from, code, more, sessionRow, row)),
+  );
+  let rowKey = "";
+  // Local only, and re-read on every sync: Rust decides what a grant is worth,
+  // so a tick the server would ignore must not look available.
+  let session = false;
+  return {
+    el,
+    sync() {
+      clear(who);
+      const ask = State.mcpAsk;
+      if (ask) {
+        who.append(agentWho(State.focusTask, "OpenCode wants to control your screen"));
+        from.textContent = State.mcp.action ?? "screen control";
+        from.style.display = "";
+        from.title = "";
+        // Never the typed text: Rust sends a description like "type 12 chars".
+        code.textContent = ask.description;
+        sessionBox.checked = session;
+        // `type_text` can type a password, so it is never grantable and the tick
+        // must not be offered for it.
+        const grantable = State.mcp.action !== "type_text";
+        sessionRow.style.display = grantable ? "" : "none";
+        clear(sessionRow);
+        if (grantable) {
+          sessionRow.append(
+            sessionBox,
+            h("span", { text: "Allow this for the next 10 minutes" }),
+          );
+        }
+        if (rowKey !== "mcp") {
+          rowKey = "mcp";
+          clear(row);
+          row.append(
+            btn("Deny", "secondary", () => {
+              session = false;
+              actions.mcpAnswer(false, false);
+            }),
+            btn("Allow", "primary", () => {
+              actions.mcpAnswer(true, session && grantable);
+            }),
+          );
+        }
+        // Screen control holds one slot, so there is never a queue behind it.
+        more.style.display = "none";
+        return;
+      }
+
+      const approval = State.pendingApproval;
+      who.append(agentWho(State.focusTask, "needs permission"));
+      // Which task is asking. "bash" on its own is not a decision anyone can make.
+      const folder = approval?.directory
+        ? approval.directory.replace(/[\\/]+$/, "").split(/[\\/]/).pop() ?? approval.directory
+        : "";
+      const label = approval?.taskTitle
+        ? `${folder ? `${folder} — ` : ""}${approval.taskTitle}`
+        : folder;
+      from.textContent = label;
+      from.style.display = label ? "" : "none";
+      from.title = approval?.directory ?? "";
+      // The whole point of approving here rather than in the terminal: this line
+      // is the command, the file path or the URL being authorised, not just the
+      // name of the tool asking.
+      code.textContent = State.pendingApproval?.command || State.pendingApproval?.tool || "…";
+      sessionRow.style.display = "none";
+      // The queue depth. Without it a person who allowed the first of three has
+      // no way to know two more are coming, and stops watching.
+      const waiting = State.approvalsWaiting;
+      more.textContent = waiting > 1 ? `${waiting - 1} more waiting` : "";
+      more.style.display = waiting > 1 ? "" : "none";
+      // Two buttons, built once. Rebuilding them between a mouse-down and a
+      // mouse-up would swallow the click, and there is nothing left to vary:
+      // "Always" is gone until the remembered-rules list exists to back it.
+      if (rowKey === "built") return;
+      rowKey = "built";
+      clear(row);
+      row.append(
+        btn("Deny", "secondary", () => actions.decide("deny"), "N"),
+        btn("Allow", "primary", () => actions.decide("allow"), "Y"),
+      );
+    },
+  };
+}
+
+// ── Question ──────────────────────────────────────────────────────────────────
+
+function buildQuestion(): ViewHost {
+  const who = h("div");
+  const title = h("div", { class: "title" });
+  const row = h("div", { class: "actions" });
+  const el = h("div", { class: "view" }, card("cyan", stack(116, 16, who, title, row)));
+  return {
+    el,
+    sync() {
+      clear(who);
+      who.append(agentWho(State.focusTask, "Claude Code is asking a question"));
+      const task = State.focusTask;
+      title.textContent = task?.steps.at(-1) ?? "Claude needs an answer.";
+      clear(row);
+      row.append(h("div", { class: "sub", text: "Answer in your terminal — Piko can't reply for you yet." }));
+    },
+  };
+}
+
+// ── Error ─────────────────────────────────────────────────────────────────────
+
+function buildError(actions: ViewActions): ViewHost {
+  const who = h("div");
+  const title = h("div", { class: "title", text: "Workflow stopped." });
+  const detail = h("div", { class: "detail" });
+  const row = h("div", { class: "actions" },
+    btn("Retry", "primary", () => actions.setView(State.defaultView())),
+    btn("Open in n8n", "secondary", () => actions.openUrl("")),
+  );
+  const el = h("div", { class: "view" }, card("red", stack(116, 16, who, title, detail, row)));
+  return {
+    el,
+    sync() {
+      const task = State.focusTask;
+      clear(who);
+      who.append(agentWho(task, task?.source === "n8n" ? "n8n" : "Claude Code"));
+      title.textContent = task?.source === "n8n" ? "Workflow stopped." : "Session stopped on an error.";
+      detail.textContent = task?.steps.at(-1) ?? "No detail available.";
+    },
+  };
+}
+
+// ── Finished ──────────────────────────────────────────────────────────────────
+
+function buildFinished(actions: ViewActions): ViewHost {
+  const who = h("div");
+  const title = h("div", { class: "title" });
+  const row = h("div", { class: "actions" },
+    btn("Open terminal", "primary", () => actions.openTerminal()),
+    btn("OK", "secondary", () => actions.collapse()),
+  );
+  const el = h("div", { class: "view" }, card("green", stack(116, 16, who, title, row)));
+  return {
+    el,
+    sync() {
+      clear(who);
+      who.append(agentWho(State.focusTask, "Claude Code finished"));
+      title.textContent = State.focusTask?.steps.at(-1) ?? "Session finished";
+    },
+  };
+}
+
+// ── Confused ──────────────────────────────────────────────────────────────────
+
+function buildConfused(): ViewHost {
+  const body = h(
+    "div",
+    { class: "stack", style: "padding:0 18px 0 128px" },
+    h("div", { class: "title", text: "Too many hits at once." }),
+    h("div", { class: "sub", text: "Give me a sec — back to work in three seconds." }),
+  );
+  return { el: h("div", { class: "view" }, card("pink", body)), sync() {} };
+}
+
+// ── Note ──────────────────────────────────────────────────────────────────────
+
+function buildNote(): ViewHost {
+  const title = h("div", { class: "title" });
+  const el = h("div", { class: "view" }, card(null, h("div", { class: "stack", style: "padding:0 18px 0 98px" }, title)));
+  return {
+    el,
+    sync() {
+      title.textContent = State.noteMessage ?? "";
+    },
+  };
+}
+
+// ── In-island settings ────────────────────────────────────────────────────────
+
+function buildSettings(actions: ViewActions): ViewHost {
+  const soundSwitch = h("button", { class: "switch", onclick: () => actions.toggleSound() });
+  const volume = h("input", {
+    type: "range", min: "0", max: "0.2", step: "0.005",
+    oninput: (e: Event) => actions.setVolume(Number((e.target as HTMLInputElement).value)),
+  }) as HTMLInputElement;
+  const autoLabel = h("span", {});
+  const segButtons = [10, 15, 30].map((s) =>
+    h("button", { onclick: () => actions.setAutoClose(s) }, `${s}s`),
+  );
+  const claudeBadge = h("span", { class: "status-badge" });
+  const apiBadge = h("span", { class: "status-badge" });
+
+  const rows = h(
+    "div",
+    { class: "settings-rows" },
+    h("div", { class: "settings-row" }, soundSwitch, h("span", { text: "Sound" }), volume),
+    h(
+      "div",
+      { class: "settings-row" },
+      svg(ICONS.timer, 12),
+      autoLabel,
+      h("div", { class: "seg" }, ...segButtons),
+    ),
+    h(
+      "div",
+      { class: "settings-row", style: "gap:14px" },
+      claudeBadge,
+      apiBadge,
+      h("div", { class: "grow" }),
+      h("button", {
+        class: "link-btn",
+        style: "color:#8e939c;font-size:11.5px",
+        text: "Settings…",
+        onclick: () => actions.openSettingsWindow(),
+      }),
+    ),
+  );
+
+  const el = h("div", { class: "view" },
+    card(null, h("div", { class: "stack", style: "padding:14px 16px 14px 84px" }, rows)));
+
+  return {
+    el,
+    sync() {
+      const s = State.settings;
+      soundSwitch.classList.toggle("on", s.soundEnabled);
+      volume.value = String(s.soundVolume);
+      volume.style.opacity = s.soundEnabled ? "1" : "0.4";
+      autoLabel.textContent = `Auto-close · ${Math.round(s.autoCloseInterval)}s`;
+      segButtons.forEach((b, i) => b.classList.toggle("on", s.autoCloseInterval === [10, 15, 30][i]));
+      clear(claudeBadge);
+      claudeBadge.append(
+        dot(s.hooksInstalled ? "#22C55E" : "#F4505E", 6),
+        h("span", { text: "Claude Code" }),
+      );
+      clear(apiBadge);
+      apiBadge.append(dot("#F4505E", 6), h("span", { text: "API" }));
+    },
+  };
+}
+
+// ── Placeholders filled in later stages ───────────────────────────────────────
+
+function buildPlaceholder(title: string, sub: string): ViewHost {
+  const body = h(
+    "div",
+    { class: "stack", style: "padding:0 18px 0 118px" },
+    h("div", { class: "title", text: title }),
+    h("div", { class: "sub", text: sub }),
+  );
+  return { el: h("div", { class: "view" }, card(null, body)), sync() {} };
+}
+
+// ── Registry ──────────────────────────────────────────────────────────────────
+
+export function buildViews(
+  actions: ViewActions,
+  onChatHeightChange: () => void,
+): Map<IslandViewName, ViewHost> {
+  const map = new Map<IslandViewName, ViewHost>();
+  map.set("overview", buildOverview(actions, onChatHeightChange));
+  map.set("empty", buildEmpty(actions));
+  map.set("approval", buildApproval(actions));
+  map.set("question", buildQuestion());
+  map.set("error", buildError(actions));
+  map.set("finished", buildFinished(actions));
+  map.set("confused", buildConfused());
+  map.set("note", buildNote());
+  map.set("settings", buildSettings(actions));
+  map.set("prompt", buildPrompt(onChatHeightChange, actions.setView));
+  map.set("upload", buildUpload());
+  map.set("uploading", buildUploading());
+  map.set("choose", buildChoose(actions));
+  // Not in the Windows v1: sending a file by email, window attach + web result.
+  map.set("mail", buildPlaceholder("Sending by email isn't in this version.", ""));
+  map.set("searching", buildPlaceholder("Claude is searching…", ""));
+  map.set("result", buildPlaceholder("Result", ""));
+  return map;
+}
+

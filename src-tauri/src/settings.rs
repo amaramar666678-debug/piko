@@ -1,0 +1,171 @@
+// Preferences, stored as plain JSON in %APPDATA%\Piko\settings.json.
+// No secret ever lands here — API keys live in the Windows Credential Manager.
+
+use crate::log;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Settings {
+    pub sound_enabled: bool,
+    pub sound_volume: f64,
+    pub auto_close_interval: f64,
+    pub absence_interval: f64,
+    pub active_integrations: Vec<String>,
+    /// "primary" = the main display, "cursor" = whichever display the mouse is on.
+    pub screen: String,
+    pub autostart: bool,
+    pub hooks_installed: bool,
+    /// Claude model used by the chat. Changeable in the settings window.
+    /// Defaulted explicitly so a settings.json written by an older build still loads.
+    #[serde(default = "default_model")]
+    pub model: String,
+    /// The last folders a task was started in are *not* here: they change from
+    /// the island, and a settings window holding a stale copy would overwrite
+    /// them on save. They live in task-folders.json instead (see tasks.rs).
+    /// Master switch for the local MCP tools. Off in every existing install and
+    /// off in a fresh one: an agent must never be able to drive the mouse until
+    /// a person says so.
+    #[serde(default)]
+    pub input_control_enabled: bool,
+    /// The little 2×2 row of 13px characters in the island's far corner, one per
+    /// agent that is not the focused one.
+    ///
+    /// Off by default, and that is a change for an existing install: it used to
+    /// always draw. The overview card already lists each of those agents as a
+    /// labelled, clickable pill carrying the same character at 24px, so the grid
+    /// repeated the information at a size nobody can name, with no way to act on
+    /// it, while floating outside the card — in the chat room, that gap is where
+    /// the agent list now lives. Kept as an option because it was part of the
+    /// original design and somebody may be used to a character sitting there.
+    #[serde(default)]
+    pub mini_grid: bool,
+    /// The agent used for new tasks. Empty means "whatever the server calls
+    /// default", which is what `GET /agent` puts first.
+    #[serde(default)]
+    pub task_agent: String,
+    /// The agent Ask mode answers with. Kept apart from `task_agent` so picking
+    /// one for a conversation does not change the agent that runs folder work.
+    #[serde(default)]
+    pub chat_agent: String,
+    /// Piko starts and owns the OpenCode server it talks to: it finds the CLI,
+    /// picks a free loopback port and generates a password for it. On by default
+    /// because the manual alternative needs the user to run a server and paste a
+    /// port into a box, which is exactly the step that goes stale. Turn it off to
+    /// go back to pointing at an address by hand.
+    #[serde(default = "default_true")]
+    pub managed_server: bool,
+    /// Selected character
+    #[serde(default = "default_character")]
+    pub character_id: String,
+    /// Where the island was dragged to, in physical pixels from the spot it
+    /// would otherwise sit in (horizontally centred on the top edge). Zero is
+    /// that default spot. Owned by Rust, not by any window holding a copy: see
+    /// `save_settings`.
+    #[serde(default)]
+    pub island_offset_x: i32,
+    #[serde(default)]
+    pub island_offset_y: i32,
+    /// Which screen edge the collapsed bubble docks to: "top", "left", "right" or
+    /// "bottom". Anything else is treated as "top", because an unrecognised value
+    /// must not be able to strand the island somewhere it cannot be reached from.
+    #[serde(default = "default_dock")]
+    pub dock: String,
+}
+
+fn default_dock() -> String {
+    "top".to_string()
+}
+
+fn default_model() -> String {
+    "opencode".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_character() -> String {
+    "heart".to_string()
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            sound_enabled: true,
+            sound_volume: 0.12,
+            auto_close_interval: 15.0,
+            absence_interval: 180.0,
+            active_integrations: vec![
+                "integration_resend".into(),
+                "integration_n8n".into(),
+                "integration_vercel".into(),
+                "integration_github".into(),
+            ],
+            screen: "primary".into(),
+            autostart: false,
+            hooks_installed: false,
+            model: default_model(),
+            input_control_enabled: false,
+            mini_grid: false,
+            task_agent: String::new(),
+            chat_agent: String::new(),
+            managed_server: true,
+            character_id: "heart".to_string(),
+            island_offset_x: 0,
+            island_offset_y: 0,
+            dock: default_dock(),
+        }
+    }
+}
+
+/// %APPDATA%\Piko
+pub fn config_dir() -> PathBuf {
+    let base = std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("Piko")
+}
+
+/// %LOCALAPPDATA%\Piko — where the log and the dropped-file inbox live.
+pub fn local_dir() -> PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("Piko")
+}
+
+fn settings_path() -> PathBuf {
+    config_dir().join("settings.json")
+}
+
+pub fn load() -> Settings {
+    let bytes = match std::fs::read(settings_path()) {
+        Ok(bytes) => bytes,
+        Err(_) => return Settings::default(),
+    };
+    // Windows editors add a UTF-8 BOM, serde_json won't skip it, and the old
+    // `unwrap_or_default` turned that one stray byte into "every preference was
+    // never set" - including the MCP master switch. Strip it, and never go
+    // quietly back to defaults on a file that was there.
+    let bytes = match bytes.strip_prefix(b"\xef\xbb\xbf".as_slice()) {
+        Some(rest) => rest,
+        None => &bytes,
+    };
+    match serde_json::from_slice(bytes) {
+        Ok(settings) => settings,
+        Err(e) => {
+            log::line(&format!("settings.json didn't parse, defaults in use: {e}"));
+            Settings::default()
+        }
+    }
+}
+
+pub fn save(settings: &Settings) -> std::io::Result<()> {
+    let dir = config_dir();
+    std::fs::create_dir_all(&dir)?;
+    let json = serde_json::to_vec_pretty(settings)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    std::fs::write(settings_path(), json)
+}

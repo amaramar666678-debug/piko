@@ -1,0 +1,56 @@
+[package]
+name = "piko"
+description = "Piko for Windows — Mochi lives at the top of your screen"
+authors = ["Louis Raille"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "piko_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-single-instance = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-notification = { version = "2.5.1", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", features = ["net", "io-util", "sync", "time", "rt"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+futures-util = "0.3"
+keyring = { version = "3", features = ["windows-native"] }
+# Both already in the tree via tauri; naming them directly is what lets the MCP
+# screenshot tool hand an agent a real PNG instead of a raw pixel buffer.
+png = "0.17"
+base64 = "0.22"
+windows = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Security_Cryptography",
+  "Win32_Storage_FileSystem",
+  "Win32_NetworkManagement_IpHelper",
+  "Win32_System_Ole",
+"Win32_System_IO",
+"Win32_System_JobObjects",
+"Win32_System_Pipes",
+  "Win32_System_StationsAndDesktops",
+  "Win32_System_SystemInformation",
+  "Win32_System_Threading",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[features]
+# Off by default in dev so a `tauri dev` run does not spam toasts; the release
+# build needs it on, or the whole notification layer is a no-op.
+default = ["toast"]
+toast = ["dep:tauri-plugin-notification"]
+

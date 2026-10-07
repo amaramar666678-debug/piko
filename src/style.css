@@ -1,0 +1,2477 @@
+/* Piko for Windows — the island. Layout, sizes and behaviour are unchanged;
+   every colour, radius, shadow and duration comes from the token file.
+
+   This stylesheet may not contain a literal colour. If a shade is missing it gets
+   a name in design/tokens.css first, so the whole palette can be re-pointed from
+   one file. Sizes still live here: they are geometry rather than taste, and the
+   island's own box is set from TypeScript every frame. */
+
+@import "./design/tokens.css";
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+  font-family: var(--font);
+  color: var(--ink);
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  cursor: default;
+}
+
+#root {
+  position: fixed;
+  inset: 0;
+}
+
+/* Invisible strip that wakes the island when it is hidden. */
+#wake-strip {
+  position: fixed;
+  top: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 240px;
+  height: 6px;
+  background: transparent;
+}
+
+/* ── Island ─────────────────────────────────────────────────────────────── */
+
+#island {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  /* The bezel. This box stands ~10px proud of the card inside it and is the part
+     of the island actually seen against the desktop, so it is a vertical gradient
+     rather than a flat fill: a flat black frame reads as a hole cut in the
+     wallpaper instead of as the rim of a pane of glass. */
+  background: linear-gradient(180deg, var(--bezel-top) 0%, var(--bezel-bottom) 100%);
+  box-shadow: var(--shadow-3);
+  /* Overwritten every frame by `applyGeometry`, which is where the corner radius
+     is actually decided — this is only what shows before the first frame. */
+  border-radius: var(--r-12);
+  overflow: visible;
+  will-change: width, height, transform;
+}
+
+#island-clip {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  border-radius: inherit;
+}
+
+#bot-canvas,
+#greeting-canvas {
+  position: absolute;
+  pointer-events: none;
+}
+
+/* The drop sequence. Sits under the header and takes over the island body; it
+   cross-fades in and out, so the last frame stays up while the views return. */
+#upload-layer {
+  position: absolute;
+  top: 0;
+  width: 640px;
+  height: 176px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--dur-220) ease-in-out;
+}
+
+#upload-layer.on {
+  opacity: 1;
+}
+
+#upload-canvas {
+  position: absolute;
+  inset: 0;
+}
+
+#upload-overlay {
+  position: absolute;
+  inset: 0;
+  display: none;
+}
+
+/* Invisible hit areas over the buttons the canvas paints. */
+.upload-hit {
+  position: absolute;
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-13);
+  background: none;
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+/* The ordinary views step aside while the sequence owns the body. */
+#views.hidden-by-upload {
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--dur-220) ease-in-out;
+}
+
+#bot-glow {
+  position: absolute;
+  pointer-events: none;
+  border-radius: var(--r-full);
+  filter: blur(6px);
+  transition: opacity var(--dur-400) ease-in-out, background var(--dur-400) ease-in-out;
+}
+
+#countdown {
+  position: absolute;
+  bottom: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  height: 2px;
+  border-radius: var(--r-2);
+  background: var(--a-30);
+  width: 0;
+}
+
+/* Compact 2×2 mini grid, to the right of the notch.
+ *
+ * Left exactly as it was. Its box is 29×29 and `applyGeometry()` recomputes
+ * `left`/`top` from that number every frame, while each mini canvas is drawn at
+ * slot/0.6 and so already spills a few pixels past its slot on all four sides.
+ * There is therefore no inset plate to put behind it: any background would be
+ * sized to a box the faces do not fill, and any padding would push the faces off
+ * the position Rust's hit test was told about. */
+#mini-grid {
+  position: absolute;
+  width: 29px;
+  height: 29px;
+  display: grid;
+  grid-template-columns: 13px 13px;
+  grid-auto-rows: 13px;
+  gap: 3px;
+  pointer-events: none;
+  transition: opacity var(--dur-250) ease-in-out;
+}
+
+/* A mini Mochi: the slot is the body, the canvas is larger and overflows it so
+   hands, badges and particles are not cut off. */
+.mini {
+  position: relative;
+  display: inline-block;
+  flex: 0 0 auto;
+}
+
+.mini canvas {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+
+/* ── Content shell (expanded) ───────────────────────────────────────────── */
+
+#content {
+  position: absolute;
+  inset: 0;
+  padding: var(--s-8) var(--s-10) var(--s-10);
+  display: flex;
+  flex-direction: column;
+  transition: opacity var(--dur-200) ease-in-out;
+}
+
+#header {
+  height: 34px;
+  flex: 0 0 34px;
+  display: flex;
+  align-items: center;
+  margin: 0 -10px;
+  /* The header drags the island. Buttons opt back out with `cursor: default`. */  cursor: grab;
+  transition: opacity var(--dur-200) ease-in-out;
+}
+
+/* Set on the island root for the length of a drag, so the cursor says so even
+   once it has left the header. */
+#island.dragging,
+#island.dragging #header {
+  cursor: grabbing;
+}
+
+/* The collapsed bubble is the drag handle: it has no header to grab. The face and
+   the glow sit above it, so the cursor comes from the island root itself.
+   Nothing of the panel may survive into the bubble: the character alone is the
+   whole island there, and the disc it used to be drawn on reads as a box drawn
+   around Mochi — worst of all while it is being dragged across a wallpaper. */
+#island.bubble {
+  cursor: grab;
+  background: transparent;
+}
+
+/* The panel fades out over 200ms while the box keeps shrinking for 340, so for
+   the first of those the card is still partly opaque. Its hairline is the edge
+   seen sliding across the island on the way down, so it goes the moment the
+   collapse starts rather than with the fill. */
+#island.bubble .card {
+  border-color: transparent;
+}
+
+#island.bubble.dragging {
+  cursor: grabbing;
+}
+
+/* Held, not yet moving: the bubble says "I am a handle" before it starts being
+   one. A scale-and-settle rather than a glow change, because the glow already
+   carries state and this must not be mistaken for it. */
+#island.bubble.grabbed {
+  animation: bubble-grab 220ms cubic-bezier(0.2, 0.9, 0.3, 1.4);
+}
+
+@keyframes bubble-grab {
+  0% {
+    transform: none;
+  }
+  55% {
+    transform: scale(1.12);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #island.bubble.grabbed {
+    animation: none;
+  }
+}
+
+
+/* One shape for every mark on the bar. They used to be two — 32×24 rounded rects
+   for the tabs, 26×26 circles for the actions — and that is what made the bar feel
+   like two unrelated rows rather than one strip. 36px circular hit areas is the
+   floor below which a person has to aim rather than point. */
+.tabs,
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--s-6);
+}
+
+/* The row grows inward: each group's own padding keeps its outermost button the
+   same distance from the island's edge as before, so nothing here changes the
+   island's width — it is fixed at 640px regardless. */
+.header-actions {
+  margin-right: auto;
+  padding-left: var(--s-14);
+}
+
+.tabs {
+  margin-left: auto;
+  padding-right: var(--s-10);
+}
+
+.tab,
+.header-actions button,
+.tabs button {
+  position: relative;
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  background: transparent;
+  border-radius: var(--r-full);
+  color: var(--dim-2);
+  cursor: default;
+  transition: background var(--dur-160), color var(--dur-160), transform var(--dur-80);
+}
+
+.tab:hover,
+.header-actions button:hover,
+.tabs button:hover {
+  background: var(--a-09);
+  color: var(--ink);
+}
+
+/* Pressed, so the bar answers the pointer rather than only the cursor. Scoped to
+   a hair of travel: at 36px a real press would shove the row sideways. */
+.tab:active,
+.header-actions button:active,
+.tabs button:active {
+  background: var(--a-12);
+  transform: scale(0.92);
+}
+
+/* The selected tab is the one place the warm accent appears in the chrome, so
+   "where am I" is answered by colour rather than by brightness alone. Kept to a
+   wash and a hairline rather than a solid fill: at 36px tall a saturated block
+   would out-shout the character sitting 40px below it. */
+.tab.on,
+.header-actions button.on {
+  background: var(--accent-wash);
+  color: var(--accent-bright);
+  box-shadow: inset 0 0 0 1px var(--accent-line);
+}
+
+/* The chat mark is the tab people come back to, so it sits a step brighter than
+   its neighbours at rest rather than only on hover. Without this the three tabs
+   were the same grey and the row read as decoration. */
+.chat-tab {
+  color: var(--ink-2);
+}
+
+.chat-tab:hover {
+  color: var(--ink);
+}
+
+.chat-tab.on {
+  color: var(--accent-bright);
+}
+
+/* An answer finished while another view was on screen. Sized and placed inside the
+   button rather than beside it, so the 36px target is not split in two. */
+.tab-badge {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 7px;
+  height: 7px;
+  border-radius: var(--r-full);
+  background: var(--accent-bright);
+  /* The ring is the panel's own colour rather than a hardcoded dark, so the dot
+     stays legible against the card wash behind the bar. */
+  box-shadow: 0 0 0 2px var(--glass-1), 0 0 7px var(--accent-glow);
+  opacity: 0;
+  transform: scale(0.4);
+  transition: opacity var(--dur-200) ease-out, transform var(--dur-200) ease-out;
+  pointer-events: none;
+}
+
+.tab.unread .tab-badge {
+  opacity: 1;
+  transform: scale(1);
+}
+
+/* The island no longer hides itself, so this is the way out besides the tray.
+   Kept dim until pointed at: it is a real button, not an alarm. */
+.header-actions button.quit:hover {
+  color: var(--red);
+  background: var(--red-wash);
+}
+
+
+#views {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.view {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  transform: scale(0.97);
+  pointer-events: none;
+  transition: opacity var(--dur-160) ease-in;
+}
+
+.view.on {
+  opacity: 1;
+  transform: scale(1);
+  pointer-events: auto;
+  transition: opacity var(--dur-300) ease-out var(--dur-160), transform var(--dur-300) cubic-bezier(0.3, 1.2, 0.4, 1) var(--dur-160);
+}
+
+/* ── Cards ──────────────────────────────────────────────────────────────── */
+
+.card {
+  position: relative;
+  height: 100%;
+  border-radius: var(--r-card);
+  /* Glass. Translucent over the bezel, so the gradient behind it shows through and
+     the two overview cards read as one pane with a seam between them rather than
+     as two boxes floating on black. `--edge-glass` is the 1px light catch along
+     the top: on a near-black panel it is the only thing that says "surface"
+     rather than "hole". */
+  background: var(--glass-1);
+  border: 1px solid var(--a-05);
+  box-shadow: var(--edge-glass), var(--shadow-2);
+  overflow: hidden;
+}
+
+.card.wash::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(
+    280px 280px at 50% 130%,
+    var(--wash) 0%,
+    transparent 70%
+  );
+  pointer-events: none;
+}
+
+/* The wash is the one place a state colour enters a card, and it enters from
+   below. Over the old opaque black it was the last layer and tinted the lower half
+   into a flat coloured haze; over the glass it has something to sit on, so it was
+   left as a plain overlay rather than given a blend mode. `screen` looked better
+   in a mock-up and was taken out again deliberately: blending here reaches past
+   the card to the transparent page root, and a state card is not something to
+   leave to the compositor when it is not the only thing that depends on it. */
+.card.wash::after {
+  opacity: 0.85;
+}
+
+/* ── Empty state ────────────────────────────────────────────────────────── */
+
+/* The one screen with nothing in it. Nothing is added to it: the left third is
+   already reserved for the character — `VIEW_LAYOUTS.empty` puts the bot at x=70
+   with a 62px body — so a mark there would sit directly behind Mochi and read as
+   a ring drawn round it. The empty state is carried by type and by the warmth
+   along the top of the card instead. */
+.view.empty .card {
+  background: linear-gradient(180deg, var(--a-warm) 0%, transparent 55%), var(--glass-1);
+}
+
+.view.empty .title {
+  color: var(--ink);
+  letter-spacing: -0.01em;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* A card whose contents can outgrow it.
+ *
+ * `.card` is `overflow: hidden` so the island keeps its rounded silhouette, which
+ * means anything past the frame is amputated rather than clipped-and-reachable.
+ * A screen with a list on it therefore needs this: the frame stays put and the
+ * contents scroll. The scrollbar is styled because the default one is a wide
+ * grey slab across a 700px panel. */
+.card-scroll {
+  position: relative;
+  z-index: 1;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-width: thin;
+  scrollbar-color: var(--a-16) transparent;
+}
+
+.card-scroll::-webkit-scrollbar {
+  width: 6px;
+}
+
+.card-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.card-scroll::-webkit-scrollbar-thumb {
+  background: var(--a-12);
+  border-radius: var(--r-pill);
+}
+
+.card-scroll::-webkit-scrollbar-thumb:hover {
+  background: var(--a-22);
+}
+
+/* Centred while it fits, top-aligned once it does not.
+ *
+ * `justify-content: center` on an overflowing flex column clips the *top* and
+ * leaves it unreachable, even inside a scroller. Auto margins do the honest
+ * thing: they share out the slack when there is slack and collapse to nothing
+ * when there is not. */
+.stack.auto {
+  height: auto;
+  margin: auto 0;
+  padding-bottom: 12px;
+}
+
+/* A card split into a scroller and a footer.
+ *
+ * The new-task screen scrolls — the window is 320 tall and the screen's content is
+ * not — and Cancel/Continue are the only way on from there apart from the Back
+ * pill, which is at the top and scrolls away first. Sticky inside the scroller was
+ * tried and is unreliable: the body is a centred flex item (`margin: auto 0`) and
+ * sticky inside a centred item does not stay where it is put. So the footer is a
+ * sibling of the scroller instead. */
+.card-split {
+  position: relative;
+  z-index: 1;
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.card-split > .card-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.card-footer {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 8px;
+  padding: 9px 18px 11px 118px;
+  border-top: 1px solid var(--hairline);
+  background: var(--card);
+}
+
+/* The way out of a screen, kept in reach while its contents scroll. */
+.card-back {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-4);
+  height: 24px;
+  padding: 0 var(--s-4) 0 7px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+  color: var(--ink-2);
+  font: var(--fw-semi) var(--fs-sm) var(--font);
+  cursor: pointer;
+  box-shadow: var(--shadow-1);
+  transition: background var(--dur-160), border-color var(--dur-160);
+}
+
+.card-back:hover {
+  background: var(--surface-3);
+  border-color: var(--a-30);
+}
+
+.card-back:hover {
+  background: var(--surface-3);
+  border-color: var(--a-30);
+}
+
+.card-back svg {
+  opacity: 0.7;
+}
+
+.dot {
+  display: inline-block;
+  border-radius: var(--r-full);
+  flex: 0 0 auto;
+}
+
+/* ── Buttons ────────────────────────────────────────────────────────────── */
+
+.btn {
+  font: var(--fw-medium) var(--fs-base) var(--font);
+  padding: 7px 13px;
+  border: 0;
+  border-radius: var(--r-pill);
+  cursor: default;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  transition: transform var(--dur-80) ease-out, background var(--dur-120) ease-out;
+}
+
+.btn:active {
+  transform: scale(0.94);
+}
+
+/* Primary stays the brightest thing in the panel — it is what "Allow" is, and a
+   decision card must not be ambiguous about which button is the safe one. The
+   warmth is a faint tint and a light-catching top edge, not a saturated fill:
+   a solid amber button would be read as the same colour as an approval state. */
+.btn.primary {
+  background: linear-gradient(180deg, var(--ink-warm) 0%, var(--ink) 100%);
+  color: var(--on-primary);
+  box-shadow: 0 1px 0 var(--a-75) inset, 0 6px 16px -8px var(--accent-glow);
+}
+
+.btn.primary:hover {
+  filter: brightness(1.04);
+}
+
+.btn.secondary {
+  background: var(--a-09);
+  color: var(--ink-2);
+  box-shadow: inset 0 0 0 1px var(--a-07);
+}
+
+.btn.secondary:hover {
+  background: var(--a-16);
+  color: var(--ink);
+}
+
+.btn .kbd {
+  font-size: 10.5px;
+  padding: 0 4px;
+  border-radius: var(--r-4);
+  opacity: 0.55;
+}
+
+.btn.primary .kbd {
+  border: 1px solid var(--on-primary-line);
+}
+
+.btn.secondary .kbd {
+  border: 1px solid var(--a-45);
+}
+
+.link-btn {
+  border: 0;
+  background: transparent;
+  font: var(--fw-medium) var(--fs-sm) var(--font);
+  cursor: default;
+}
+
+/* Keyboard focus.
+ *
+ * There was none: the island is a webview full of real buttons and inputs, and
+ * Tab moved between them invisibly. `:focus-visible` rather than `:focus` so a
+ * pointer press does not leave a ring behind on the glass. */
+:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+  border-radius: var(--r-4);
+}
+
+.icon-btn {
+  width: 16px;
+  height: 16px;
+  border: 0;
+  border-radius: var(--r-full);
+  background: var(--surface-1);
+  color: var(--dim-4);
+  display: grid;
+  place-items: center;
+  cursor: default;
+}
+
+/* ── Overview ───────────────────────────────────────────────────────────── */
+
+.overview {
+  display: flex;
+  gap: var(--s-10);
+  height: 100%;
+}
+
+.overview > .left {
+  flex: 0 0 322px;
+  width: 322px;
+}
+
+.overview > .right {
+  flex: 1 1 auto;
+}
+
+.card-body {
+  position: relative;
+  z-index: 1;
+  padding-top: 10px;
+}
+
+.who {
+  padding: 0 36px 0 108px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.who .name {
+  font: var(--fw-semi) var(--fs-md) var(--font);
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.who .tool {
+  font: var(--fw-normal) var(--fs-sm) var(--font);
+  color: var(--dim-2);
+  white-space: nowrap;
+}
+
+.who .count {
+  font: var(--fw-normal) var(--fs-sm) var(--font);
+  color: var(--dim-3);
+  margin-left: auto;
+  flex: 0 0 auto;
+}
+
+.jump {
+  position: absolute;
+  top: 8px;
+  right: 10px;
+  z-index: 2;
+}
+
+/* Ticker */
+
+.ticker {
+  position: relative;
+  height: 44px;
+  margin: 6px 12px 0 108px;
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    transparent 0%,
+    #000 12%,
+    #000 85%,
+    transparent 100%
+  );
+  mask-image: linear-gradient(to bottom, transparent 0%, #000 12%, #000 85%, transparent 100%);
+}
+
+.ticker-row {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  transform-origin: left center;
+  will-change: transform, opacity;
+}
+
+.ticker-row .tick-icon {
+  width: 12px;
+  display: grid;
+  place-items: center;
+  flex: 0 0 12px;
+  color: var(--dim-2);
+}
+
+.ticker-row .tick-text {
+  font: var(--fw-medium) var(--fs-lg) var(--font);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Shimmer sweep, 2.2 s — same as TickerShimmerText / ShimmeringText */
+.shimmer {
+  background: linear-gradient(
+    90deg,
+    var(--shimmer-dim) 0%,
+    var(--shimmer-bright) 40%,
+    var(--shimmer-dim) 70%
+  );
+  background-size: 260% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: shimmer 2.2s linear infinite;
+}
+
+@keyframes shimmer {
+  from {
+    background-position: 130% 0;
+  }
+  to {
+    background-position: -130% 0;
+  }
+}
+
+/* ── Agent pills ────────────────────────────────────────────────────────── */
+
+/* The agent row: a 2×2 grid of agents with the "+" beside it. It is a flex row
+   rather than one grid so that adding the "+" cannot push a fifth pill onto a
+   third row, where the card would clip it. */
+.pills {
+  position: relative;
+  z-index: 1;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  gap: var(--s-6);
+  padding: 0 var(--s-8);
+}
+
+.pill-grid {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  grid-auto-rows: 28px;
+  gap: var(--s-4);
+  align-content: center;
+}
+
+/* The "+". Deliberately not a pill: it has no agent, no colour and no label, and
+   giving it a pill's border would make it look like a fifth agent.
+
+   It is the island's one empty slot, so it is drawn as one: a dashed warm ring
+   with nothing behind it, against the four filled pills beside it. The warm tint
+   is what separates "add another agent" from the cool grey it used to be — the
+   ring is dashed and colourless otherwise and disappears into the row. */
+.pill.add {
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px dashed var(--accent-line);
+  border-radius: var(--r-full);
+  background: var(--accent-wash);
+  color: var(--accent-bright);
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  /* 30px below the row's centre line, so it hangs off the grid instead of
+     competing with a fourth slot. `top` rather than `margin-top`, because the
+     row is `align-items: center` and would only give half a margin back, and
+     rather than `transform`, which the hover scale needs to itself. */
+  position: relative;
+  top: 30px;
+  box-shadow: 0 0 0 4px var(--accent-wash);
+  transition: background var(--dur-160), border-color var(--dur-160),
+    color var(--dur-160), transform var(--dur-160), box-shadow var(--dur-160);
+}
+
+.pill.add:hover {
+  background: var(--accent-wash);
+  border-color: var(--accent);
+  color: var(--text);
+  transform: scale(1.06);
+  box-shadow: 0 0 0 4px var(--accent-wash), 0 4px 14px -4px var(--accent-glow),
+    inset 0 0 0 1px var(--accent-deep);
+}
+
+/* The list the "+" reveals, in place of the pills.
+ *
+   Inline rather than floating on purpose. Rust sets the window click-through
+   outside the rectangle the front end pushes (island.rs `spawn_cursor_poll`), so
+   anything drawn past the island's edge cannot be clicked at all — it looked
+   right and did nothing. Staying inside the card is what makes it work. */
+.agent-picker {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-content: center;
+  align-items: center;
+  gap: 3px;
+}
+
+.agent-picker-empty {
+  font: var(--fw-medium) var(--fs-xs2) var(--font);
+  color: var(--dim-3);
+  padding: 0 4px;
+}
+
+.agent-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  height: 24px;
+  padding: 0 8px 0 6px;
+  border: 1px solid var(--a-16);
+  border-radius: var(--r-pill);
+  background: var(--surface-1);
+  color: var(--text);
+  font: var(--fw-semi) var(--fs-xs2) var(--font);
+  cursor: pointer;
+  transition: background var(--dur-160), border-color var(--dur-160);
+}
+
+  .agent-row:hover {
+    background: var(--a-09);
+    border-color: var(--a-30);
+  }
+
+  /* ── New task: agent + what the task should do ───────────────────────────── */
+
+  .kind-agents {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 5px;
+  }
+
+  .kind-row {
+    display: flex;
+    gap: 6px;
+    margin-top: 5px;
+  }
+
+  .kind-btn {
+    flex: 1 1 0;
+    height: 30px;
+    border: 1px solid var(--a-16);
+    border-radius: var(--r-10);
+    background: var(--surface-1);
+    color: var(--dim);
+    font: var(--fw-semi) var(--fs-sm) var(--font);
+    cursor: pointer;
+    transition: background var(--dur-160), border-color var(--dur-160), color var(--dur-160);
+  }
+
+  .kind-btn:hover {
+    background: var(--a-09);
+    color: var(--text);
+  }
+
+  .kind-btn.on {
+    background: var(--indigo-wash);
+    border-color: var(--indigo-line);
+    color: var(--ink);
+  }
+
+  /* The agent the task will use has to be readable at a glance, not just present. */
+  .agent-row[data-chosen="true"] {
+    background: var(--indigo-soft);
+    border-color: var(--indigo-line-soft);
+    color: var(--ink);
+  }
+
+
+.agent-row i {
+  width: 7px;
+  height: 7px;
+  border-radius: var(--r-full);
+  flex: 0 0 auto;
+}
+
+/* The agent row, in the new-task screen: what is in it, and what can go in.
+ * The two lists are the same chip with opposite ends, so the glyph on the right
+ * is the whole difference — a row already in the row can only be taken out. */
+.agent-row-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  text-align: start;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.agent-row.on {
+  border-color: var(--a-30);
+  background: var(--a-09);
+}
+
+.agent-row-x,
+.agent-row-add {
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 13px;
+  height: 13px;
+  border-radius: var(--r-full);
+}
+
+.agent-row-x {
+  color: var(--dim-3);
+}
+
+.agent-row-x svg,
+.agent-row-add svg {
+  opacity: 0.85;
+}
+
+.agent-row-x:hover {
+  color: var(--on-primary);
+  background: var(--red);
+}
+
+.agent-row-add {
+  color: var(--dim-4);
+}
+
+.agent-picker-done {
+  height: 24px;
+  padding: 0 9px;
+  border: 1px dashed var(--a-22);
+  border-radius: var(--r-pill);
+  background: transparent;
+  color: var(--dim-2);
+  font: var(--fw-semi) var(--fs-xs2) var(--font);
+  cursor: pointer;
+}
+
+.agent-picker-done:hover {
+  color: var(--text);
+  border-color: var(--a-45);
+}
+
+.pill {
+  position: relative;
+  height: 28px;
+  border-radius: var(--r-pill);
+  /* Sunken rather than raised: the pills sit *in* the card, and a raised plate at
+     this size would compete with the card's own edge light. */
+  background: var(--surface-sunken);
+  border: 1px solid var(--a-12);
+  display: flex;
+  align-items: center;
+  cursor: default;
+  padding: 0 var(--s-8) 0 var(--s-3);
+  gap: var(--s-3);
+  transition: transform var(--dur-200) var(--ease-spring), background var(--dur-180), border-color var(--dur-180),
+    box-shadow var(--dur-180), filter var(--dur-180);
+}
+
+.pill .mini {
+  margin-left: 0;
+}
+
+/* Beside the face, not across it.
+ *
+ * The label used to be absolutely positioned over the whole pill and centred,
+ * while the character's canvas sits at the pill's left edge overflowing its slot
+ * by a third of its width. The two overlapped by design, which is why every pill
+ * read as a face with a name printed across its middle — "piko agent · Resend"
+ * was unreadable at the island's real width. In flow the face gets its own space
+ * and the text ellipsises instead of colliding. The face is drawn from a canvas
+ * at bodySize/0.6 (see createMiniBot), so the slot and the overflow are the same
+ * width and nothing is cropped. */
+.pill .lbl {
+  position: static;
+  flex: 1 1 auto;
+  min-width: 0;
+text-align: start;
+  font: var(--fw-semi) var(--fs-xs) var(--font);
+  color: var(--dim-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding: 0;
+  pointer-events: none;
+}
+
+.pill:hover {
+  transform: scale(1.04);
+  filter: brightness(1.06);
+}
+
+/* Inside the pill, not hanging off its edge.
+ *
+ * It used to sit at `top: -3px`, which put a third of it in the 4px gap above and
+ * within reach of the neighbouring row of the 2x2 grid — two pills and a badge each
+ * fighting over the same pixels. Insetting it costs nothing visually because the
+ * mark is read as part of the pill, not as a separate object floating over it. */
+.pill-badge {
+  position: absolute;
+  top: 1px;
+  right: 1px;
+  width: 12px;
+  height: 12px;
+  border-radius: var(--r-full);
+  background: var(--on-primary);
+  /* The pill's own fill as a ring, so the mark reads on top of the face rather than
+     merging into it. */
+  box-shadow: 0 0 0 1.5px var(--card-flat);
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+}
+
+.pill-badge i {
+  width: 12px;
+  height: 12px;
+  border-radius: var(--r-full);
+  display: grid;
+  place-items: center;
+  color: var(--on-primary);
+}
+
+.pill-badge svg {
+  width: 5px;
+  height: 5px;
+}
+
+/* ── Generic text blocks ────────────────────────────────────────────────── */
+
+.title {
+  font: var(--fw-semi) var(--fs-xl) var(--font);
+}
+
+.sub {
+  font: var(--fw-normal) var(--fs-lg) var(--font);
+  color: var(--dim);
+}
+
+.detail {
+  font: var(--fw-normal) var(--fs-md) var(--font);
+  color: var(--red-text);
+}
+
+.who-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font: var(--fw-normal) var(--fs-md) var(--font);
+  color: var(--dim-2);
+}
+
+.who-row .n {
+  font: var(--fw-semi) var(--fs-md) var(--font);
+  color: var(--ink);
+}
+
+.code {
+  font: var(--fw-normal) var(--fs-md) var(--mono);
+  color: var(--ink);
+  background: var(--surface-2);
+  border: 1px solid var(--a-05);
+  border-radius: var(--r-10);
+  padding: 5px 10px;
+  max-width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  user-select: text;
+}
+
+.stack {
+  position: relative;
+  z-index: 1;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 5px;
+}
+
+.actions {
+  display: flex;
+  gap: var(--s-8);
+}
+
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font: var(--fw-normal) var(--fs-sm) var(--font);
+  color: var(--dim-2);
+}
+
+/* ── Settings view (in-island) ──────────────────────────────────────────── */
+
+.settings-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.settings-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font: var(--fw-normal) var(--fs-base) var(--font);
+  color: var(--ink-2);
+}
+
+.switch {
+  position: relative;
+  width: 32px;
+  height: 18px;
+  border-radius: var(--r-9);
+  background: var(--a-16);
+  flex: 0 0 32px;
+  transition: background var(--dur-180);
+  cursor: default;
+  border: 0;
+}
+
+.switch.on {
+  background: var(--green);
+}
+
+.switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: var(--r-full);
+  background: #fff;
+  transition: transform var(--dur-180);
+}
+
+.switch.on::after {
+  transform: translateX(14px);
+}
+
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 3px;
+  border-radius: var(--r-2);
+  background: var(--a-20);
+  width: 72px;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 11px;
+  height: 11px;
+  border-radius: var(--r-full);
+  background: var(--ink);
+}
+
+.seg {
+  display: flex;
+  gap: 6px;
+  margin-left: auto;
+}
+
+.seg button {
+  font: var(--fw-normal) var(--fs-sm) var(--font);
+  padding: 3px 7px;
+  border: 0;
+  border-radius: var(--r-pill);
+  background: transparent;
+  color: var(--dim-3);
+  cursor: default;
+}
+
+.seg button.on {
+  background: var(--surface-3);
+  color: var(--ink);
+}
+
+/* ── Utility ────────────────────────────────────────────────────────────── */
+
+.grow {
+  flex: 1 1 auto;
+}
+
+.nowrap {
+  white-space: nowrap;
+}
+
+/* ── Chat (prompt view) ─────────────────────────────────────────────────── */
+
+/* The one card that is meant to be looked at rather than glanced past. It was the
+   same flat glass as everything else, which made the room — the only view with
+   something to read in it — the hardest to find on the panel. A very slight
+   indigo lift from the top corner, warm-neutral from the bottom: enough to read as
+   lit, not enough to compete with the character or the accent. */
+.chat-card {
+  overflow: hidden;
+  background:
+    linear-gradient(158deg, var(--indigo-wash) 0%, transparent 42%),
+    linear-gradient(0deg, var(--a-warm) 0%, transparent 40%),
+    var(--glass-2);
+  box-shadow: inset 0 0 0 1px var(--a-09);
+}
+
+.chat-body {
+  position: relative;
+  z-index: 1;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-8);
+  /* Wider margins than the other cards, and the left inset still reserves the
+     character's column. The extra 4px of breathing room is what makes the room
+     read as a panel rather than as a list inside one. */
+  padding: 14px 20px 16px 88px;
+}
+
+.chip-row:empty {
+  display: none;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: var(--r-pill);
+  background: var(--a-09);
+  font: var(--fw-normal) var(--fs-sm2) var(--font);
+  color: var(--ink-2);
+  border: 1.5px solid var(--a-75);
+  transform: scale(1.06);
+  transition: border-color var(--dur-300) ease-out var(--dur-450), transform var(--dur-300) ease-out var(--dur-450);
+}
+
+.chip.settled {
+  border-color: transparent;
+  transform: scale(1);
+}
+
+.chip-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: var(--r-full);
+  background: linear-gradient(135deg, var(--chip-spectrum));
+}
+
+.chat-log {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 2px 0;
+  scrollbar-width: thin;
+  scrollbar-color: var(--a-20) transparent;
+}
+
+.chat-row {
+  display: flex;
+}
+
+.chat-row.user {
+  justify-content: flex-end;
+  padding-left: 32px;
+}
+
+.bubble {
+  background: var(--a-12);
+  border-radius: var(--r-12);
+  padding: 6px 10px;
+  font: var(--fw-normal) var(--fs-base) var(--font);
+  color: var(--ink-2);
+  white-space: pre-wrap;
+  user-select: text;
+}
+
+.reply {
+  font: var(--fw-normal) var(--fs-base) var(--font);
+  color: var(--ink-2);
+  white-space: pre-wrap;
+  padding-right: 8px;
+  user-select: text;
+}
+
+.typing {
+  display: flex;
+  gap: 4px;
+  padding: 4px 2px;
+}
+
+.typing i {
+  width: 5px;
+  height: 5px;
+  border-radius: var(--r-full);
+  background: var(--dim-3);
+  animation: typing 0.9s ease-in-out infinite;
+}
+
+.typing i:nth-child(2) {
+  animation-delay: var(--dur-140);
+}
+
+.typing i:nth-child(3) {
+  animation-delay: var(--dur-280);
+}
+
+@keyframes typing {
+  0%, 100% { transform: scale(0.6); }
+  50% { transform: scale(1.2); }
+}
+
+/* The composer. Bigger than it was, and lifted off the panel with a soft inner
+   glow rather than a hard border: this is the one control in the island a person
+   touches on every single question, so it gets the depth. */
+.chat-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--s-8);
+  padding: 8px 8px 8px 10px;
+  background: var(--surface-1);
+  border-radius: var(--r-13);
+  box-shadow:
+    inset 0 1px 0 var(--sheen),
+    inset 0 0 0 1px var(--a-09),
+    0 4px 18px rgba(0, 0, 0, 0.28);
+  transition: box-shadow var(--dur-200) ease-out;
+}
+
+/* Focus glows the bar rather than outlining the input, because the input is
+   transparent — an outline on it would draw a box in the middle of the composer. */
+.chat-bar:focus-within {
+  box-shadow:
+    inset 0 1px 0 var(--sheen),
+    inset 0 0 0 1px var(--accent-line),
+    0 4px 22px rgba(0, 0, 0, 0.3),
+    0 0 0 3px var(--accent-wash);
+}
+
+.chat-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  /* A touch taller than the line, so the caret has room to breathe in a field
+     that is now the room's main event. */
+  padding: 5px 0;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  font: var(--fw-normal) var(--fs-xl) var(--font);
+  outline: none;
+  cursor: text;
+}
+
+.chat-input::placeholder {
+  color: var(--dim-3);
+}
+
+/* Bigger than the header's marks on purpose: it is the one button whose press is
+   never ambiguous. */
+.send-btn {
+  width: 34px;
+  height: 34px;
+  flex: 0 0 34px;
+  border: 0;
+  border-radius: var(--r-full);
+  background: var(--ink);
+  color: var(--on-primary);
+  display: grid;
+  place-items: center;
+  cursor: default;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.32);
+  transition: transform var(--dur-80) ease-out, background var(--dur-160);
+}
+
+.send-btn:hover {
+  background: var(--ink-warm);
+}
+
+.send-btn:active {
+  transform: scale(0.94);
+}
+
+/* Send while idle, Stop while a turn is in flight. The square is deliberately not
+   the accent fill: Stop must not read as "the primary thing to do here", and the
+   white-on-dark square is the standard stop mark at this size. */
+.send-btn.stop {
+  background: rgba(255, 255, 255, 0.12);
+  color: var(--ink);
+  box-shadow: none;
+}
+
+.send-btn.stop:hover {
+  background: rgba(255, 255, 255, 0.18);
+}
+
+/* ── Drop zone ──────────────────────────────────────────────────────────── */
+
+.drop-card {
+  background: var(--card-flat);
+  border: 0;
+}
+
+.drop-frame {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.drop-frame rect {
+  stroke: var(--a-12);
+  animation: dash-march 1.1s linear infinite, dash-breathe 7s ease-in-out infinite;
+}
+
+.drop-card.over {
+  background: radial-gradient(200px 200px at 50% 100%, var(--green-line-soft), transparent 70%),
+    var(--card-flat);
+}
+
+.drop-card.over .drop-frame rect {
+  stroke: var(--green-line);
+  animation: dash-march 1.1s linear infinite;
+}
+
+@keyframes dash-march {
+  to { stroke-dashoffset: -11; }
+}
+
+@keyframes dash-breathe {
+  0%, 100% { stroke: var(--a-12); }
+  50% { stroke: var(--a-16); }
+}
+
+.drop-body {
+  position: relative;
+  z-index: 1;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 8px;
+  padding-left: 196px;
+}
+
+.drop-title {
+  font: var(--fw-medium) var(--fs-lg) var(--font);
+  color: var(--ink-2);
+  transition: color var(--dur-200);
+}
+
+.drop-card.over .drop-title {
+  color: var(--green-2);
+}
+
+.drop-tags {
+  display: flex;
+  gap: 6px;
+}
+
+.drop-tags span {
+  font: var(--fw-normal) var(--fs-sm) var(--font);
+  padding: 3px 8px;
+  border-radius: var(--r-pill);
+  background: var(--a-07);
+  color: var(--ink-2);
+}
+
+/* ── Uploading ──────────────────────────────────────────────────────────── */
+
+.up-card {
+  background: radial-gradient(260px 260px at 50% 140%, var(--green-wash), transparent 70%),
+    var(--card);
+}
+
+.up-card.done {
+  background: radial-gradient(260px 260px at 50% 140%, var(--green-wash-strong), transparent 70%),
+    var(--card);
+}
+
+.up-row {
+  position: absolute;
+  left: 26px;
+  top: 36px;
+  width: 526px;
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font: var(--fw-normal) var(--fs-base) var(--font);
+  color: var(--dim);
+}
+
+.up-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.up-name.done {
+  color: var(--green-2);
+  font-weight: 600;
+}
+
+.up-pct {
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+  flex: 0 0 auto;
+}
+
+.up-track {
+  position: absolute;
+  left: 26px;
+  top: 58px;
+  width: 526px;
+  height: 6px;
+  border-radius: var(--r-3);
+  background: var(--a-09);
+}
+
+.up-fill {
+  height: 6px;
+  border-radius: var(--r-3);
+  background: linear-gradient(90deg, var(--green-deep), var(--state-finished));
+}
+
+.up-glow {
+  position: absolute;
+  left: 0;
+  top: -3px;
+  width: 28px;
+  height: 12px;
+  border-radius: var(--r-full);
+  background: var(--green-glow);
+  filter: blur(5px);
+  pointer-events: none;
+}
+
+/* ── Integration cards (overview, left card) ────────────────────────────── */
+
+.left-body {
+  position: relative;
+  z-index: 1;
+  height: 100%;
+}
+
+.int-card {
+  padding: 10px 12px 0 108px;
+  display: flex;
+  flex-direction: column;
+}
+
+.int-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding-right: 24px;
+}
+
+.int-head b {
+  font: var(--fw-semi) var(--fs-md) var(--font);
+  color: var(--ink);
+}
+
+.int-head > span {
+  font: var(--fw-normal) var(--fs-sm) var(--font);
+  color: var(--dim-2);
+  white-space: nowrap;
+}
+
+.int-total {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 2px;
+}
+
+.int-total span {
+  font: var(--fw-medium) var(--fs-sm) var(--font);
+  color: var(--ink-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.pulse {
+  width: 4px;
+  height: 4px;
+  border-radius: var(--r-full);
+  background: var(--green);
+  animation: pulse 1.8s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 0.2; }
+  50% { opacity: 1; }
+}
+
+.int-status {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding-top: 4px;
+  font: var(--fw-normal) var(--fs-sm) var(--font);
+  color: var(--dim-3);
+}
+
+.int-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-top: 6px;
+}
+
+/* The idle card's actions. These are real buttons, not the text links the rest
+   of the card uses: they are the only way to get from here to the tool itself. */
+.int-actions .btn {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.int-actions .int-open {
+  padding: 5px 11px 5px 9px;
+}
+
+.int-actions .int-open svg {
+  opacity: 0.7;
+}
+
+.int-actions .int-refresh {
+  padding: 5px 7px;
+}
+
+.int-actions .int-refresh:hover svg {
+  transform: rotate(90deg);
+}
+
+.int-actions .int-refresh svg {
+  transition: transform var(--dur-220) cubic-bezier(0.3, 1.2, 0.4, 1);
+}
+
+.int-actions .int-settings {
+  color: var(--dim-2);
+}
+
+.int-actions .int-settings:hover {
+  color: var(--ink);
+}
+
+/* Only the loading state breathes. The dot the helper paints is coloured
+   inline, so the animation has to hang off the row's own class. */
+.int-status.is-loading .dot {
+  animation: int-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes int-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+.int-status.is-ready {
+  color: var(--dim-2);
+}
+
+.int-status.is-error {
+  color: var(--red-text);
+}
+
+.int-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding-top: 5px;
+}
+
+.int-rows.tight {
+  gap: 2px;
+  padding-top: 4px;
+}
+
+.int-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px;
+  border-radius: var(--r-5);
+  min-width: 0;
+}
+
+.int-name {
+  font: var(--fw-medium) var(--fs-sm) var(--font);
+  color: var(--dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.int-row.first .int-name {
+  color: var(--ink-2);
+}
+
+.int-ago {
+  font: var(--fw-normal) var(--fs-xs) var(--font);
+  color: var(--dim-3);
+  flex: 0 0 auto;
+}
+
+.int-sub {
+  font: var(--fw-normal) var(--fs-xs) var(--font);
+  color: var(--dim-5);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.int-amount {
+  font: var(--fw-medium) var(--fs-sm) var(--mono);
+  margin-left: auto;
+  flex: 0 0 auto;
+}
+
+.int-time {
+  font: var(--fw-medium) var(--fs-xs) var(--mono);
+  color: var(--sand);
+  flex: 0 0 auto;
+}
+
+.int-more,
+.int-back {
+  border: 0;
+  background: transparent;
+  color: var(--dim-3);
+  display: grid;
+  place-items: center;
+  cursor: default;
+  flex: 0 0 auto;
+}
+
+.int-more {
+  width: 18px;
+  height: 18px;
+}
+
+.int-back {
+  width: 28px;
+  height: 28px;
+}
+
+.int-stats {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding-top: 8px;
+  padding-right: 12px;
+}
+
+.int-stat {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.int-stat-icon {
+  width: 14px;
+  display: grid;
+  place-items: center;
+}
+
+.int-stat-label {
+  font: var(--fw-normal) var(--fs-sm) var(--font);
+  color: var(--dim-3);
+}
+
+.int-stat-value {
+  margin-left: auto;
+  font: var(--fw-semi) var(--fs-md) var(--font);
+  color: var(--ink-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.int-balance {
+  display: flex;
+  align-items: baseline;
+  gap: 3px;
+  padding-top: 4px;
+}
+
+.int-balance span {
+  font: var(--fw-bold) var(--fs-display) var(--mono);
+  color: var(--ink);
+}
+
+.int-balance i {
+  font: var(--fw-semi) var(--fs-2xs) var(--font);
+  font-style: normal;
+  color: var(--dim-3);
+}
+
+.int-page {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  cursor: default;
+  min-width: 0;
+}
+
+.int-page:hover {
+  background: var(--surface-1);
+  border-radius: var(--r-5);
+}
+
+.int-emoji {
+  width: 14px;
+  font-size: var(--fs-xs);
+  color: var(--dim-3);
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  font-style: normal;
+}
+
+.int-empty {
+  font: var(--fw-normal) var(--fs-sm) var(--font);
+  color: var(--dim-3);
+  padding-left: 8px;
+}
+
+.int-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px;
+  border-radius: var(--r-pill);
+  border: 1px solid transparent;
+  color: var(--dim-3);
+  cursor: default;
+  max-width: 100%;
+  min-width: 0;
+}
+
+.int-detail-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.int-detail-head b {
+  font: var(--fw-semi) var(--fs-sm) var(--font);
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.int-badge {
+  font: var(--fw-medium) var(--fs-xs) var(--font);
+  padding: 2px 6px;
+  border-radius: var(--r-pill);
+  margin-left: auto;
+  flex: 0 0 auto;
+}
+
+.int-detail-body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-top: 8px;
+}
+
+.int-commit {
+  font: var(--fw-normal) var(--fs-xs2) var(--font);
+  color: var(--ink-2);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.int-meta {
+  display: flex;
+  gap: 8px;
+  font: var(--fw-normal) var(--fs-xs) var(--font);
+  color: var(--dim-3);
+}
+
+.int-link {
+  border: 0;
+  background: transparent;
+  font: var(--fw-normal) var(--fs-xs) var(--mono);
+  color: var(--indigo-link);
+  text-align: left;
+  cursor: default;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.int-detail-text {
+  font: var(--fw-normal) var(--fs-xs2)/1.5 var(--mono);
+  color: var(--dim);
+  margin-top: 8px;
+  max-height: 88px;
+  overflow: auto;
+  white-space: pre-wrap;
+  user-select: text;
+}
+
+.int-card.detail {
+  padding-top: 8px;
+}
+
+/* ══ Tasks ═══════════════════════════════════════════════════════════════════ */
+/* Task cards and the task composer. Same language as the integration cards: one
+   quiet row per thing, colour only on the state dot. */
+
+.task-list {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 6px 8px;
+  overflow-y: auto;
+  max-height: 210px;
+}
+
+.task-card {
+  border-radius: var(--r-12);
+  background: var(--surface-1);
+  border: 1px solid var(--hairline);
+  padding: 7px 9px;
+}
+
+.task-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.task-title {
+  font: var(--fw-medium) var(--fs-sm2)/1.35 var(--font);
+  color: var(--ink);
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-state {
+  font: var(--fw-semi) var(--fs-2xs2) var(--font);
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  flex: none;
+}
+
+.task-meta {
+  display: flex;
+  gap: 6px;
+  margin-top: 2px;
+  font: var(--fw-normal) var(--fs-2xs2) var(--mono);
+  color: var(--dim);
+}
+
+.task-agent {
+  opacity: 0.7;
+}
+
+.task-step {
+  margin-top: 3px;
+  font: var(--fw-normal) var(--fs-xs2)/1.4 var(--mono);
+  color: var(--ink-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-todos {
+  display: flex;
+  gap: 6px;
+  margin-top: 3px;
+  font: var(--fw-normal) var(--fs-xs)/1.4 var(--font);
+  color: var(--dim);
+}
+
+.task-todo-count {
+  flex: none;
+  font-family: var(--mono);
+}
+
+.task-todo-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-error {
+  margin-top: 3px;
+  font: var(--fw-normal) var(--fs-xs)/1.4 var(--mono);
+  color: var(--red);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-btns {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  display: none;
+  gap: 4px;
+}
+
+.task-card:hover .task-btns {
+  display: flex;
+}
+
+.task-btn {
+  width: 18px;
+  height: 18px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: var(--r-6);
+  background: var(--surface-2);
+  color: var(--ink-2);
+  cursor: default;
+}
+
+.task-btn:hover {
+  background: var(--a-20);
+  color: var(--ink);
+}
+
+.task-btn:active {
+  transform: scale(0.92);
+}
+
+.task-followup {
+  display: flex;
+  gap: 5px;
+  margin-top: 6px;
+}
+
+.task-followup-input {
+  flex: 1;
+  min-width: 0;
+  font: var(--fw-normal) var(--fs-xs2) var(--font);
+  color: var(--ink);
+  background: var(--surface-1);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-8);
+  padding: 4px 7px;
+}
+
+.task-followup-input:focus {
+  outline: none;
+  border-color: var(--a-22);
+}
+
+/* Task composer — the same box as the chat, pointed at a folder instead. */
+
+/* A real segmented control: one inset track, two halves that share it, so the
+   choice reads as exclusive rather than as two buttons that happen to be near each
+   other. It was two separate pills at 10.5px with no container, which at this size
+   looked like loose labels. */
+.mode-row {
+  display: inline-flex;
+  align-self: flex-start;
+  gap: 2px;
+  padding: 2px;
+  border-radius: var(--r-pill);
+  background: var(--surface-sunken);
+  box-shadow: inset 0 0 0 1px var(--a-07);
+}
+
+.mode-btn {
+  font: var(--fw-medium) var(--fs-sm) var(--font);
+  padding: 4px 14px;
+  border: 0;
+  border-radius: var(--r-pill);
+  background: transparent;
+  color: var(--dim);
+  cursor: default;
+  transition: background var(--dur-160), color var(--dur-160), box-shadow var(--dur-160);
+}
+
+.mode-btn:hover {
+  color: var(--ink-2);
+}
+
+.mode-btn.on {
+  background: var(--surface-3);
+  color: var(--ink);
+  box-shadow: inset 0 1px 0 var(--sheen);
+}
+
+.task-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 0 0 7px;
+}
+
+.folder-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font: var(--fw-medium) var(--fs-sm) var(--font);
+  color: var(--ink);
+}
+
+.folder-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.folder-btn,
+.recent-btn {
+  font: var(--fw-medium) var(--fs-xs) var(--font);
+  padding: 3px 9px;
+  border: 0;
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+  color: var(--ink-2);
+  cursor: default;
+  flex: none;
+}
+
+.recent-btn:hover,
+.folder-btn:hover {
+  background: var(--a-16);
+  color: var(--ink);
+}
+
+.recent-row {
+  display: flex;
+  gap: 4px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.recent-row::-webkit-scrollbar {
+  display: none;
+}
+
+/* ── The agent picker in the chat room ─────────────────────────────────────── */
+
+/* A row of cards rather than a closed dropdown. The dropdown it replaces hid the
+   one thing that makes an agent worth choosing — what it is for — and hid itself
+   entirely whenever the fetch had not succeeded, which is how "OpenCode is not
+   answering" came to look like "there is nothing to pick". */
+.agent-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--s-8);
+  flex: none;
+}
+
+.agent-cards {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  gap: var(--s-6);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.agent-cards::-webkit-scrollbar {
+  display: none;
+}
+
+.agent-card {
+  flex: 0 0 auto;
+  width: 176px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 10px 7px;
+  border: 1px solid transparent;
+  border-radius: var(--r-10);
+  background: var(--surface-1);
+  color: var(--ink-2);
+  text-align: left;
+  cursor: default;
+  transition: background var(--dur-160), border-color var(--dur-160), transform var(--dur-80);
+}
+
+.agent-card:hover {
+  background: var(--surface-2);
+  border-color: var(--a-12);
+}
+
+.agent-card:active {
+  transform: scale(0.98);
+}
+
+.agent-card.on {
+  background: var(--accent-wash);
+  border-color: var(--accent-line);
+  color: var(--ink);
+  box-shadow: inset 0 1px 0 var(--sheen);
+}
+
+.agent-card-name {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  font: var(--fw-medium) var(--fs-sm2) var(--font);
+  color: inherit;
+}
+
+/* Marks the agent OpenCode would have used anyway, so the default choice is not
+   just "whichever is first" but says so. */
+.agent-card-def {
+  font: var(--fw-normal) var(--fs-2xs2) var(--mono);
+  font-style: normal;
+  color: var(--accent-bright);
+  opacity: 0.85;
+}
+
+.agent-card.on .agent-card-def {
+  opacity: 1;
+}
+
+/* Two lines and no more. A card that grew to fit its whole description would push
+   the log off the panel, and the rest is one hover away. */
+.agent-card-desc {
+  font: var(--fw-normal) var(--fs-xs) var(--font);
+  line-height: 1.35;
+  color: var(--dim);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.agent-card.on .agent-card-desc {
+  color: var(--ink-2);
+}
+
+/* ── When there is no list ─────────────────────────────────────────────────── */
+
+/* Shown instead of the cards, never in place of the room: an unreachable OpenCode
+   must not look like an empty one. Amber, because that is this island's existing
+   language for "something needs a decision or an action" and a person should not
+   have to learn a second colour code for it. */
+.agent-problem {
+  display: flex;
+  align-items: center;
+  gap: var(--s-8);
+  flex: none;
+  padding: 7px 10px;
+  border-radius: var(--r-10);
+  background: color-mix(in srgb, var(--amber) 14%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--amber) 34%, transparent);
+}
+
+.agent-note-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  font: var(--fw-normal) var(--fs-xs2)/1.4 var(--font);
+  color: var(--ink-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-retry {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  border: 0;
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+  color: var(--ink);
+  font: var(--fw-medium) var(--fs-xs2) var(--font);
+  cursor: default;
+  transition: background var(--dur-160), transform var(--dur-80);
+}
+
+.agent-retry:hover {
+  background: var(--a-20);
+}
+
+.agent-retry:active {
+  transform: scale(0.96);
+}
+
+.agent-retry svg {
+  display: block;
+  color: var(--amber);
+}
+
+/* ── Who is answering ──────────────────────────────────────────────────────── */
+
+/* The chosen agent's name, on the composer itself. The list above the log can be
+   scrolled away or hidden by the failure row; this cannot. */
+.agent-chip {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 116px;
+  padding: 4px 9px;
+  border-radius: var(--r-pill);
+  background: var(--accent-wash);
+  box-shadow: inset 0 0 0 1px var(--accent-line);
+  font: var(--fw-medium) var(--fs-xs2) var(--font);
+  color: var(--accent-bright);
+}
+
+.agent-chip > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-chip-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: var(--r-full);
+  background: var(--accent-bright);
+  box-shadow: 0 0 6px var(--accent-glow);
+}
+
+.recent-label {
+  font: var(--fw-normal) var(--fs-2xs2) var(--mono);
+  color: var(--dim);
+}
+
+.approval-from {
+  font: var(--fw-normal) var(--fs-xs)/1.4 var(--mono);
+  color: var(--dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-bottom: 2px;
+}
+
+/* -- MCP: screen control ------------------------------------------------------ */
+
+/* The indicator is a status line, not a card: it sits between the pills and the
+   task list and only appears when input control is on or a card is up. Amber
+   because that is the same colour as every other "something wants a decision"
+   state in the island, and a person should not have to learn a second language. */
+.mcp-indicator {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px;
+  margin: 2px 0;
+  font: var(--fw-normal) var(--fs-2xs2) var(--mono);
+  color: var(--dim);
+}
+
+.mcp-label {
+  color: var(--ink);
+}
+
+.mcp-note {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.75;
+}
+
+.mcp-indicator .btn {
+  padding: 2px 7px;
+  font-size: var(--fs-2xs2);
+}
+
+/* Only offered for actions a grant can cover. `type_text` hides the row rather
+   than showing a tick the server would ignore. */
+.mcp-session {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin: 2px 0 6px;
+  font: var(--fw-normal) var(--fs-xs) var(--font);
+  color: var(--dim);
+  cursor: pointer;
+}
+
+.mcp-session input {
+  accent-color: var(--amber);
+  margin: 0;
+  cursor: pointer;
+}
+
+/* How many approvals are queued behind the card. Amber, because it belongs to
+   the same card, and small: it is context, not a second headline. */
+.approval-more {
+  font: var(--fw-medium) var(--fs-xs) var(--font);
+  color: var(--amber);
+  margin: 0 0 6px;
+  letter-spacing: 0.01em;
+}

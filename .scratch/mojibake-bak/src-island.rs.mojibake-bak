@@ -1,0 +1,912 @@
+// Island window: placement on the chosen display, the two window sizes
+// (full panel / invisible wake strip), click-through and the cursor poll.
+//
+// There is no notch on a PC, so the island is a black shape drawn at the top
+// centre of the main display inside a borderless, transparent, always-on-top
+// window that never takes focus.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
+
+use serde::Serialize;
+use tauri::{AppHandle, Emitter, Manager, Monitor, PhysicalPosition, PhysicalSize, WebviewWindow};
+
+use windows::core::BOOL;
+use windows::Win32::Foundation::LPARAM;
+use windows::Win32::Foundation::{HWND, POINT};
+use windows::Win32::System::Ole::RevokeDragDrop;
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
+use windows::Win32::UI::WindowsAndMessaging::{EnumChildWindows, GetClassNameW};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetCursorPos, GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW,
+};
+
+/// Logical size of the full window Ã¢â‚¬â€ the largest island view, like the macOS panel.
+pub const PANEL_W: f64 = 720.0;
+pub const PANEL_H: f64 = 320.0;
+
+/// The collapsed island's window.
+///
+/// It used to stay 720Ãƒâ€”320 and draw the bubble inside it, which sounds harmless
+/// and is not: a 720-wide window on a 1280-wide screen can only move between x=0
+/// and x=560, so the bubble could never reach within half its width of either
+/// side. Dragging it felt like hitting invisible walls. The window is now the
+/// bubble's own neighbourhood, so the bubble can go anywhere on the display.
+///
+/// Wider than the 56 px bubble because the glow is `BUBBLE * 1.7` across and is
+/// drawn inside this window — sized to the bubble it would be clipped at the edge
+/// of every screen it touched.
+pub const COMPACT_W: f64 = 104.0;
+pub const COMPACT_H: f64 = 104.0;
+
+pub const STRIP_W: f64 = 240.0;
+pub const STRIP_H: f64 = 6.0;
+
+pub const WINDOW_LABEL: &str = "island";
+
+/// Margin around the island that still counts as "on the island", in logical px.
+/// Wider than the macOS 6 pt because a click must never be swallowed.
+const HIT_MARGIN: f64 = 14.0;
+
+#[derive(Serialize, Clone)]
+pub struct CursorPayload {
+    pub x: f64,
+    pub y: f64,
+}
+
+#[derive(Serialize, Clone)]
+pub struct ScreenInfo {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub scale: f64,
+}
+
+/// The island shape in window-logical coordinates, pushed by the front end.
+/// The poll thread owns the click-through decision so it lands in the same 16 ms
+/// tick as the cursor read Ã¢â‚¬â€ an IPC round trip here loses clicks.
+#[derive(Clone, Copy, Default)]
+pub struct IslandRect {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
+/// Wakes / parks the cursor poll thread so a hidden island costs literally nothing.
+pub struct PollGate {
+    active: Mutex<bool>,
+    cv: Condvar,
+    /// What shape the window is right now. Three states, because the collapsed
+    /// island is no longer the panel with something small drawn on it: it is a
+    /// 104Ãƒâ€”104 window of its own, and the difference is what makes it draggable
+    /// to the far side of the screen.
+    pub shape: Mutex<Shape>,
+    pub rect: Mutex<IslandRect>,
+    /// Mirrors the window flag so we only call into Win32 when it changes.
+    ignoring: AtomicBool,
+    /// A drag is in progress. The island is deliberately outside its own pushed
+    /// rect while it is being moved, so without this the click-through logic
+    /// would engage and drop the drag on the first pixel.
+    dragging: AtomicBool,
+}
+
+impl PollGate {
+    pub fn new() -> Self {
+        Self {
+            active: Mutex::new(false),
+            cv: Condvar::new(),
+            shape: Mutex::new(Shape::Strip),
+            rect: Mutex::new(IslandRect::default()),
+            ignoring: AtomicBool::new(false),
+            dragging: AtomicBool::new(false),
+        }
+    }
+
+    pub fn set_dragging(&self, on: bool) {
+        self.dragging.store(on, Ordering::Relaxed);
+        self.forget_ignore_state();
+    }
+
+    pub fn is_dragging(&self) -> bool {
+        self.dragging.load(Ordering::Relaxed)
+    }
+
+    pub fn set_rect(&self, rect: IslandRect) {
+        *self.rect.lock().unwrap() = rect;
+    }
+
+    /// The window's current shape.
+    pub fn shape(&self) -> Shape {
+        *self.shape.lock().unwrap()
+    }
+
+    pub fn set_shape(&self, shape: Shape) {
+        *self.shape.lock().unwrap() = shape;
+    }
+
+    /// Forces the next poll tick to re-apply the flag (after a window resize).
+    pub fn forget_ignore_state(&self) {
+        self.ignoring.store(false, Ordering::Relaxed);
+    }
+
+    pub fn set_active(&self, on: bool) {
+        let mut guard = self.active.lock().unwrap();
+        *guard = on;
+        self.cv.notify_all();
+    }
+
+    fn wait_until_active(&self) {
+        let mut guard = self.active.lock().unwrap();
+        while !*guard {
+            guard = self.cv.wait(guard).unwrap();
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        *self.active.lock().unwrap()
+    }
+}
+
+pub fn window(app: &AppHandle) -> Option<WebviewWindow> {
+    app.get_webview_window(WINDOW_LABEL)
+}
+
+/// `target_monitor`, for callers outside this module that need to place something.
+pub fn target_monitor_pub(app: &AppHandle, pref: &str) -> Option<Monitor> {
+    target_monitor(app, pref)
+}
+
+fn cursor_physical() -> Option<(f64, f64)> {
+    let mut p = POINT::default();
+    unsafe { GetCursorPos(&mut p).ok()? };
+    Some((p.x as f64, p.y as f64))
+}
+
+/// Lets dropped files reach the app again.
+///
+/// wry installs its drop target by walking the webview's child windows **once**,
+/// when the webview is created. WebView2 creates `Chrome_RenderWidgetHostHWND`
+/// later and registers its own target on it; being the innermost window, that one
+/// wins, and since the page has no HTML5 drop handler it refuses everything Ã¢â‚¬â€ the
+/// "no drop" cursor, with nothing reaching Tauri. Revoking it makes OLE fall
+/// through to the target wry registered on the parent widget, which is the one
+/// that feeds Tauri's drag events.
+///
+/// Cheap and idempotent, so it is simply re-run whenever a drag might be starting.
+pub fn unblock_webview_drops(app: &AppHandle) {
+    for label in [WINDOW_LABEL, "settings"] {
+        let Some(win) = app.get_webview_window(label) else {
+            continue;
+        };
+        let Some(hwnd) = hwnd_of(&win) else { continue };
+        unsafe {
+            let _ = EnumChildWindows(Some(hwnd), Some(revoke_render_widget), LPARAM(0));
+        }
+    }
+}
+
+unsafe extern "system" fn revoke_render_widget(hwnd: HWND, _: LPARAM) -> BOOL {
+    let mut name = [0u16; 64];
+    let len = unsafe { GetClassNameW(hwnd, &mut name) };
+    if len > 0 {
+        let class = String::from_utf16_lossy(&name[..len as usize]);
+        if class == "Chrome_RenderWidgetHostHWND" {
+            let _ = unsafe { RevokeDragDrop(hwnd) };
+        }
+    }
+    true.into()
+}
+
+/// True while the left mouse button is held Ã¢â‚¬â€ the only signal we get that a
+/// drag might be in flight before it reaches the window.
+fn left_button_down() -> bool {
+    unsafe { (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000) != 0 }
+}
+
+fn monitor_contains(m: &Monitor, x: f64, y: f64) -> bool {
+    let p = m.position();
+    let s = m.size();
+    x >= p.x as f64
+        && x < (p.x + s.width as i32) as f64
+        && y >= p.y as f64
+        && y < (p.y + s.height as i32) as f64
+}
+
+/// The display the island lives on: the primary one, or the one under the cursor.
+fn target_monitor(app: &AppHandle, pref: &str) -> Option<Monitor> {
+    let monitors = app.available_monitors().ok()?;
+    if pref == "cursor" {
+        if let Some((cx, cy)) = cursor_physical() {
+            if let Some(m) = monitors.iter().find(|m| monitor_contains(m, cx, cy)) {
+                return Some(m.clone());
+            }
+        }
+    }
+    app.primary_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| monitors.into_iter().next())
+}
+
+pub fn screen_info(app: &AppHandle, pref: &str) -> ScreenInfo {
+    match target_monitor(app, pref) {
+        Some(m) => {
+            let scale = m.scale_factor();
+            let p = m.position();
+            let s = m.size();
+            ScreenInfo {
+                x: p.x as f64 / scale,
+                y: p.y as f64 / scale,
+                width: s.width as f64 / scale,
+                height: s.height as f64 / scale,
+                scale,
+            }
+        }
+        None => ScreenInfo {
+            x: 0.0,
+            y: 0.0,
+            width: 1920.0,
+            height: 1080.0,
+            scale: 1.0,
+        },
+    }
+}
+
+/// Where the island's top-left goes, given the spot it would sit at by default,
+/// how far it was dragged, the display it lives on and its own size.
+///
+/// Clamped rather than trusted. A stored offset from a larger display, or one
+/// predating a rescale, must never be able to strand the island offscreen with
+/// no way to drag it back Ã¢â‚¬â€ that is the failure this whole calculation exists to
+/// prevent, so it is pure and tested on its own.
+fn place(
+    base: (i32, i32),
+    offset: (i32, i32),
+    monitor: (i32, i32, u32, u32),
+    size: (u32, u32),
+) -> (i32, i32) {
+    let (mx, my, mw, mh) = monitor;
+    let (pw, ph) = (size.0 as i32, size.1 as i32);
+    let max_x = (mx + mw as i32 - pw).max(mx);
+    let max_y = (my + mh as i32 - ph).max(my);
+    (
+        base.0.saturating_add(offset.0).clamp(mx, max_x),
+        base.1.saturating_add(offset.1).clamp(my, max_y),
+    )
+}
+
+/// Whether this window-relative point is over the island shape the front end pushed.
+///
+/// The margin on every side is not slack: by the time a cursor has travelled from
+/// clear of the island to a button, the click-through flag has to be off already.
+fn hits_island(r: &IslandRect, x: f64, y: f64) -> bool {
+    r.w > 0.0
+        && x >= r.x - HIT_MARGIN
+        && x <= r.x + r.w + HIT_MARGIN
+        && y >= r.y - HIT_MARGIN
+        && y <= r.y + r.h + HIT_MARGIN
+}
+
+/// Whether a press at this window-relative point counts as "outside the island".
+///
+/// Measured against the **window**, not the island shape. The window is the whole
+/// 720x320 overlay, so anything inside it belongs to the island as far as
+/// dismissal is concerned Ã¢â‚¬â€ including the transparent margin around the card and
+/// any stale frame of the pushed shape. A rule that could fire on a press aimed
+/// at a button would be far worse than the one it replaces: the panel vanishing
+/// under the cursor is the failure nobody forgives.
+fn is_outside_press(x: f64, y: f64, size: (f64, f64), dragging: bool) -> bool {
+    if dragging {
+        return false;
+    }
+    !(x >= 0.0 && x <= size.0 && y >= 0.0 && y <= size.1)
+}
+
+/// Any dock string, made into one of the four real edges.
+///
+/// An empty or misspelt value has to land somewhere. `dock_offset` is driven
+/// from a string that crosses a version boundary and can also be hand-edited, and
+/// an unrecognised edge that quietly meant "nowhere" is how the bubble ended up
+/// drawn in a corner nobody chose.
+pub fn normalise_dock(dock: &str) -> &'static str {
+    match dock.trim().to_ascii_lowercase().as_str() {
+        "left" => "left",
+        "right" => "right",
+        "bottom" => "bottom",
+        _ => "top",
+    }
+}
+
+/// Where the island's top-left has to be so the *bubble* sits centred on `dock`.
+///
+/// The window is the bubble's own 104Ãƒâ€”104 box, so this is one subtraction: the
+/// window's centre has to land on the screen's edge. There is no "place it at the
+/// edge inside the window" half any more, which is the whole reason dragging felt
+/// like it was hitting walls Ã¢â‚¬â€ a 720-wide window could not slide far enough for
+/// the bubble inside it to reach either side of the screen.
+///
+/// The bubble is centred *on* the edge rather than flush against it: a circle
+/// whose centre sits exactly on the line would be half off-screen.
+pub fn dock_position(
+    dock: &str,
+    bubble: (i64, i64),
+    monitor: (i32, i32, u32, u32),
+    scale: f64,
+) -> (i32, i32) {
+    // Everything below is in CSS pixels and the monitor Ã¢â‚¬â€ the one thing that
+    // arrives in physical ones Ã¢â‚¬â€ is converted once, here. Mixing the two is what
+    // put a bubble a third of a screen off at 150% scaling.
+    let scale = if scale <= 0.0 { 1.0 } else { scale };
+    let mpx = monitor.0 as f64 / scale;
+    let mpy = monitor.1 as f64 / scale;
+    let mpw = monitor.2 as f64 / scale;
+    let mph = monitor.3 as f64 / scale;
+
+    let (bw, bh) = (bubble.0 as f64, bubble.1 as f64);
+
+    // Where the bubble's centre goes on screen, per edge.
+    let (centre_x, centre_y) = match normalise_dock(dock) {
+        "left" => (mpx + bw / 2.0, mpy + mph / 2.0),
+        "right" => (mpx + mpw - bw / 2.0, mpy + mph / 2.0),
+        "bottom" => (mpx + mpw / 2.0, mpy + mph - bh / 2.0),
+        // "top" and anything unrecognised: the bubble hangs off the screen's top
+        // edge, which is where it has always been.
+        _ => (mpx + mpw / 2.0, mpy + bh / 2.0),
+    };
+
+    // The window's top-left, from the bubble's centre on screen. Half the
+    // *window*, not half the bubble: the bubble is drawn centred in a COMPACT_W box
+    // and this function returns where that box goes. Subtracting half the bubble
+    // put every edge 24px out — the left and right edges still looked right
+    // because the clamp hid it, but the vertical ones drifted.
+    let x = centre_x - COMPACT_W / 2.0;
+    let y = centre_y - COMPACT_H / 2.0;
+
+    // Clamped with the *window's* size, not the bubble's. The bubble is centred in
+    // a 104px window and this function returns where that window goes, so clamping
+    // by the 56px bubble let the window hang 48px off the right of the display â€”
+    // and a window off the display means its glow is clipped away.
+    //
+    // The bubble therefore stops 24px short of the edge, which is exactly the
+    // padding the glow needs: the light still reaches the screen edge.
+    let max_x = (mpx + mpw - COMPACT_W).max(mpx);
+    let max_y = (mpy + mph - COMPACT_H).max(mpy);
+    (
+        (x.clamp(mpx, max_x) * scale).round() as i32,
+        (y.clamp(mpy, max_y) * scale).round() as i32,
+    )
+}
+
+/// What shape the window is, which is also what the island is doing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Shape {
+    /// Panel open: 720Ãƒâ€”320, the bubble nowhere in particular.
+    Panel,
+    /// Collapsed to the bubble: 104Ãƒâ€”104, and this is what makes it draggable
+    /// anywhere rather than only across the middle of the screen.
+    Bubble,
+    /// Hidden: the 240Ãƒâ€”6 wake strip.
+    Strip,
+}
+
+/// Places and sizes the window for `shape`. `offset` is where the user dragged it,
+/// in physical pixels from the spot it would otherwise sit in, so a dragged
+/// position survives collapsing and reopening Ã¢â‚¬â€ and a display change.
+pub fn apply_geometry(app: &AppHandle, pref: &str, shape: Shape, offset: (i32, i32)) {
+    let Some(win) = window(app) else { return };
+    let Some(m) = target_monitor(app, pref) else {
+        return;
+    };
+
+    let scale = m.scale_factor();
+    let mp = *m.position();
+    let ms = *m.size();
+
+    let (lw, lh) = match shape {
+        Shape::Panel => (PANEL_W, PANEL_H),
+        Shape::Bubble => (COMPACT_W, COMPACT_H),
+        Shape::Strip => (STRIP_W, STRIP_H),
+    };
+    let pw = (lw * scale).round().max(1.0) as u32;
+    let ph = (lh * scale).round().max(1.0) as u32;
+    // The offset is measured from the centre of the *shape*, so the same stored
+    // value keeps the bubble in the same spot when the window changes size around
+    // it. Measuring from the top-left instead is what made a dragged bubble jump
+    // by a third of the screen every time the panel opened and closed.
+    let base = (mp.x + (ms.width as i32 - pw as i32) / 2, mp.y);
+    let (x, y) = place(base, offset, (mp.x, mp.y, ms.width, ms.height), (pw, ph));
+
+    let _ = win.set_size(PhysicalSize::new(pw, ph));
+    let _ = win.set_position(PhysicalPosition::new(x, y));
+    // Moving across displays can rescale the window: re-assert the physical size.
+    let _ = win.set_size(PhysicalSize::new(pw, ph));
+    let _ = win.set_always_on_top(true);
+}
+
+/// The island window's top-left in CSS pixels. The front end needs this to turn a
+/// pointer drag into an absolute target: it cannot work the display's scale out
+/// for itself, and mixing its CSS pixels with ours is how a drag ends up drifting.
+pub fn position_css(app: &AppHandle) -> Option<(f64, f64)> {
+    let win = window(app)?;
+    let scale = win.scale_factor().ok()?;
+    let pos = win.outer_position().ok()?;
+    Some((pos.x as f64 / scale, pos.y as f64 / scale))
+}
+
+/// Moves the island to `x`/`y` given in CSS pixels, returning the physical offset
+/// from the spot it would otherwise sit in.
+///
+/// Only meaningful for the bubble: with the window shrunk to the bubble's own
+/// size there is nothing left to be clamped away from the middle of the screen,
+/// so this is a plain move.
+pub fn move_to_css(app: &AppHandle, pref: &str, x: f64, y: f64) -> Option<(i32, i32)> {
+    let win = window(app)?;
+    let m = target_monitor(app, pref)?;
+    let scale = win.scale_factor().ok()?;
+    let outer = win.outer_size().ok()?;
+    let pw = outer.width;
+    let ph = outer.height;
+    let mp = *m.position();
+    let ms = *m.size();
+
+    let base = (mp.x + (ms.width as i32 - pw as i32) / 2, mp.y);
+    let (phys_x, phys_y) = place(
+        base,
+        (
+            (x * scale).round() as i32 - base.0,
+            (y * scale).round() as i32 - base.1,
+        ),
+        (mp.x, mp.y, ms.width, ms.height),
+        (pw, ph),
+    );
+
+    let _ = win.set_position(PhysicalPosition::new(phys_x, phys_y));
+    Some((phys_x - base.0, phys_y - base.1))
+}
+
+fn hwnd_of(win: &WebviewWindow) -> Option<HWND> {
+    let raw = win.hwnd().ok()?.0 as isize;
+    if raw == 0 {
+        return None;
+    }
+    Some(HWND(raw as *mut _))
+}
+
+/// WS_EX_NOACTIVATE keeps clicks from stealing focus; WS_EX_TOOLWINDOW keeps the
+/// island out of Alt-Tab.
+pub fn make_non_activating(win: &WebviewWindow) {
+    let Some(hwnd) = hwnd_of(win) else { return };
+    unsafe {
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let want = ex | WS_EX_NOACTIVATE.0 as isize | WS_EX_TOOLWINDOW.0 as isize;
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, want);
+    }
+}
+
+/// Temporarily allow activation so a text field inside the island can be typed in.
+pub fn set_activating(win: &WebviewWindow, activating: bool) {
+    let Some(hwnd) = hwnd_of(win) else { return };
+    unsafe {
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let want = if activating {
+            ex & !(WS_EX_NOACTIVATE.0 as isize)
+        } else {
+            ex | WS_EX_NOACTIVATE.0 as isize
+        };
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, want);
+    }
+}
+
+/// Position, size and scale of the monitor the island lives on. Any change here
+/// means the island has to be placed again.
+fn current_screen_key(app: &AppHandle) -> Option<(i32, i32, u32, u32, u64)> {
+    let pref = app
+        .try_state::<crate::Shared>()
+        .map(|s| s.settings.lock().unwrap().screen.clone())
+        .unwrap_or_else(|| "primary".into());
+    let m = target_monitor(app, &pref)?;
+    let p = m.position();
+    let size = m.size();
+    Some((
+        p.x,
+        p.y,
+        size.width,
+        size.height,
+        m.scale_factor().to_bits(),
+    ))
+}
+
+/// Emits `cursor` (window-logical coordinates) at ~60 Hz while the island is
+/// visible. Parked on a condvar the rest of the time.
+pub fn spawn_cursor_poll(app: AppHandle, gate: Arc<PollGate>) {
+    std::thread::spawn(move || {
+        let mut was_down = false;
+        // Remembered across wakes so a display change while hidden is noticed the
+        // moment the island comes back.
+        let mut last_screen: Option<(i32, i32, u32, u32, u64)> = None;
+        loop {
+            gate.wait_until_active();
+            let mut last = (f64::MIN, f64::MIN);
+            let mut ticks: u32 = 0;
+            while gate.is_active() {
+                std::thread::sleep(Duration::from_millis(16));
+
+                // Monitors get plugged in, unplugged, rearranged and rescaled, and
+                // an island pinned to coordinates that no longer exist is an island
+                // nobody can reach. Checked about twice a second Ã¢â‚¬â€ the cursor poll
+                // is already running, so this costs one monitor query.
+                ticks = ticks.wrapping_add(1);
+                if ticks % 30 == 0 {
+                    let now = current_screen_key(&app);
+                    if now.is_some() && now != last_screen {
+                        let first = last_screen.is_none();
+                        last_screen = now;
+                        if !first {
+                            crate::log::line(
+                                "display layout changed Ã¢â‚¬â€ repositioning".to_string(),
+                            );
+                            let _ = app.emit_to(WINDOW_LABEL, "screen-changed", ());
+                        }
+                    }
+                }
+
+                let Some(win) = window(&app) else { continue };
+                let Ok(origin) = win.outer_position() else {
+                    continue;
+                };
+                let scale = win.scale_factor().unwrap_or(1.0);
+                let Some((cx, cy)) = cursor_physical() else {
+                    continue;
+                };
+                let x = (cx - origin.x as f64) / scale;
+                let y = (cy - origin.y as f64) / scale;
+                let size = match win.inner_size() {
+                    Ok(s) => (s.width as f64 / scale, s.height as f64 / scale),
+                    Err(_) => (PANEL_W, PANEL_H),
+                };
+
+// Click-through: the window only takes the mouse over the island
+                // shape. A small entry margin means the flag is already off by the
+                // time a moving cursor reaches a button.
+                let r = *gate.rect.lock().unwrap();
+                let on_island = hits_island(&r, x, y);
+
+                // A press is read before the "the cursor did not move" bail-out
+                // below, because a click that lands without moving the pointer is
+                // exactly the case that still has to count — and it is the common
+                // one.
+                let down = left_button_down();
+                let press = down && !was_down;
+                was_down = down;
+
+                if press {
+                    // A press may be the start of a file drag: make sure the drop
+                    // target is ours before the file arrives. WS_EX_TRANSPARENT —
+                    // what click-through is on Windows — hides the window from
+                    // WindowFromPoint, so OLE finds no drop target and shows the
+                    // "no drop" cursor. macOS has no such problem: AppKit delivers
+                    // drags to registered destinations whatever
+                    // ignoresMouseEvents says.
+                    let handle = app.clone();
+                    let _ = app.run_on_main_thread(move || unblock_webview_drops(&handle));
+
+                    // A press outside the island is a dismissal, and this is the
+                    // only place that can know about it: out there the window is
+                    // click-through, so the press belongs to whatever is
+                    // underneath and the webview never hears about it.
+                    if is_outside_press(x, y, size, gate.is_dragging()) {
+                        let _ = win.emit_to(WINDOW_LABEL, "outside-press", ());
+                    }
+                }
+
+                let dragging = down && x >= 0.0 && x <= size.0 && y >= 0.0 && y <= size.1;
+
+                // Click-through is settled here, *before* the movement bail-out
+                // below, and that ordering is the whole point: the island moves
+                // without the cursor moving. Collapsing to the bubble shrinks the
+                // pushed rect out from under a stationary pointer, and a flag that
+                // only refreshes on movement leaves a 104×104 window eating clicks
+                // meant for the desktop in exactly the spot the panel used to cover
+                // — the cursor feels glued to the island long after it left.
+                let accept = on_island || dragging || gate.is_dragging();
+                if gate.ignoring.load(Ordering::Relaxed) == accept {
+                    gate.ignoring.store(!accept, Ordering::Relaxed);
+                    let _ = win.set_ignore_cursor_events(!accept);
+                }
+
+                if (x - last.0).abs() < 1.0 && (y - last.1).abs() < 1.0 {
+                    continue;
+                }
+                last = (x, y);
+
+                let _ = win.emit("cursor", CursorPayload { x, y });
+            }
+        }
+    });
+}
+
+pub fn set_ignore_cursor(app: &AppHandle, ignore: bool) {
+    if let Some(win) = window(app) {
+        let _ = win.set_ignore_cursor_events(ignore);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::place;
+
+    const SCREEN: (i32, i32, u32, u32) = (0, 0, 1920, 1080);
+    const PANEL: (u32, u32) = (720, 320);
+    /// Where `place` puts the island with no offset: centred on the top edge.
+    fn base() -> (i32, i32) {
+        (600, 0)
+    }
+
+    #[test]
+    fn no_offset_means_the_middle_of_the_top_edge() {
+        assert_eq!(place(base(), (0, 0), SCREEN, PANEL), (600, 0));
+    }
+
+    #[test]
+    fn a_drag_is_honoured() {
+        assert_eq!(place(base(), (-400, 300), SCREEN, PANEL), (200, 300));
+    }
+
+    #[test]
+    fn the_island_cannot_be_dragged_off_the_display() {
+        // Far past every edge: an island stranded offscreen has no drag handle to
+        // bring back, which is the bug the clamp exists for.
+        assert_eq!(place(base(), (-99_999, -99_999), SCREEN, PANEL), (0, 0));
+        assert_eq!(place(base(), (99_999, 99_999), SCREEN, PANEL), (1200, 760));
+    }
+
+    #[test]
+    fn an_offset_from_a_wider_display_stays_reachable() {
+        // Saved on a 2560-wide screen, then that screen is unplugged.
+        let wide = (2560 - 720) / 2;
+        let dragged = place(base(), (wide, 0), SCREEN, PANEL);
+        assert!(
+            dragged.0 >= 0 && dragged.0 + PANEL.0 as i32 <= 1920,
+            "{dragged:?}"
+        );
+    }
+
+    #[test]
+    fn a_second_monitor_to_the_left_is_measured_from_its_own_edge() {
+        let screen = (-2560, 0, 2560, 1440);
+        let base = ((-2560 + (2560 - 720) / 2), 0);
+        // Dragged towards the far left of that display, and no further.
+        assert_eq!(place(base, (-5000, 0), screen, PANEL), (-2560, 0));
+        assert_eq!(place(base, (0, 0), screen, PANEL), base);
+    }
+
+    #[test]
+    fn the_collapsed_strip_still_may_be_dragged_down() {
+        // The wake strip is only 6px tall, so its vertical range is the whole
+        // display; a stored offset from when the island was a panel still applies.
+        let strip = (240, 6);
+        assert_eq!(place(base(), (0, 500), SCREEN, strip), (600, 500));
+    }
+}
+
+#[cfg(test)]
+mod hit_tests {
+    use super::{hits_island, IslandRect, HIT_MARGIN};
+
+    /// The panel the island occupies inside the 720x320 window.
+    const PANEL: IslandRect = IslandRect { x: 40.0, y: 0.0, w: 640.0, h: 176.0 };
+    /// The collapsed bubble: a quarter of the width, a third of the height.
+    const BUBBLE: IslandRect = IslandRect { x: 0.0, y: 108.0, w: 104.0, h: 104.0 };
+
+    #[test]
+    fn the_panel_takes_the_mouse_over_its_own_shape() {
+        assert!(hits_island(&PANEL, 40.0, 0.0));
+        assert!(hits_island(&PANEL, 680.0, 176.0));
+        assert!(hits_island(&PANEL, 360.0, 88.0));
+    }
+
+    #[test]
+    fn the_margin_is_what_lets_a_cursor_reach_a_button() {
+        // A press this far out still belongs to the island: the flag is already
+        // off by the time a cursor moving in from here arrives at the edge.
+        assert!(hits_island(&PANEL, 40.0 - HIT_MARGIN, 88.0));
+        assert!(hits_island(&PANEL, 680.0 + HIT_MARGIN, 88.0));
+        assert!(hits_island(&PANEL, 360.0, 176.0 + HIT_MARGIN));
+        // One pixel further out is the desktop's.
+        assert!(!hits_island(&PANEL, 40.0 - HIT_MARGIN - 1.0, 88.0));
+        assert!(!hits_island(&PANEL, 360.0, 176.0 + HIT_MARGIN + 1.0));
+    }
+
+    /// The bug the ordering in `spawn_cursor_poll` exists to prevent: a pointer
+    /// sitting where the panel used to be must not be captured once the island has
+    /// shrunk to the bubble under it.
+    #[test]
+    fn a_stationary_cursor_is_released_when_the_island_shrinks() {
+        let spot = (360.0, 88.0);
+        assert!(hits_island(&PANEL, spot.0, spot.1));
+        assert!(!hits_island(&BUBBLE, spot.0, spot.1));
+    }
+
+    #[test]
+    fn a_rect_of_no_size_never_takes_the_mouse() {
+        // The front end pushes a zero rect before the first frame; without this the
+        // point (0,0) would sit inside the margin of nothing and be swallowed.
+        let empty = IslandRect::default();
+        assert!(!hits_island(&empty, 0.0, 0.0));
+        assert!(!hits_island(&empty, -HIT_MARGIN, -HIT_MARGIN));
+    }
+}
+
+#[cfg(test)]
+mod dismissal_tests {
+    use super::is_outside_press;
+
+    const PANEL: (f64, f64) = (720.0, 320.0);
+
+    #[test]
+    fn a_press_anywhere_inside_the_window_never_dismisses() {
+        // The whole overlay belongs to the island, including the transparent
+        // margin around the card and any stale frame of the pushed shape. A rule
+        // that fired on a press aimed at a button would drop the panel under the
+        // cursor, which is the failure nobody forgives.
+        for (x, y) in [
+            (0.0, 0.0),
+            (719.0, 319.0),
+            (360.0, 160.0),
+            (12.0, 300.0), // transparent margin beside the card
+            (700.0, 20.0),
+        ] {
+            assert!(
+                !is_outside_press(x, y, PANEL, false),
+                "({x},{y}) is inside the window and must not dismiss"
+            );
+        }
+    }
+
+    #[test]
+    fn a_press_past_the_window_edge_dismisses() {
+        assert!(is_outside_press(-1.0, 100.0, PANEL, false));
+        assert!(is_outside_press(721.0, 100.0, PANEL, false));
+        assert!(is_outside_press(360.0, -1.0, PANEL, false));
+        assert!(is_outside_press(360.0, 321.0, PANEL, false));
+        assert!(is_outside_press(-5000.0, -5000.0, PANEL, false));
+    }
+
+    #[test]
+    fn a_drag_in_progress_is_never_a_dismissal() {
+        // The island is under the cursor by definition while it is being moved,
+        // and it may briefly extend past its own window.
+        assert!(!is_outside_press(-50.0, -50.0, PANEL, true));
+        assert!(!is_outside_press(900.0, 400.0, PANEL, true));
+    }
+}
+
+#[cfg(test)]
+mod dock_tests {
+    use super::{dock_position, normalise_dock, COMPACT_H, COMPACT_W, PANEL_H, PANEL_W};
+
+    const SCREEN: (i32, i32, u32, u32) = (0, 0, 1920, 1080);
+    /// The bubble, which is also the compact window's subject.
+    const BUBBLE: (i64, i64) = (56, 56);
+
+    /// The monitor as this code sees it: **physical** pixels, which is what
+    /// `Monitor::size()` returns. A 1920Ã—1080 desktop at 1.5 scaling is
+    /// 2880Ã—1620 here and 1920Ã—1080 to the webview.
+    fn screen(scale: f64) -> (i32, i32, u32, u32) {
+        (
+            0,
+            0,
+            (1920.0 * scale).round() as u32,
+            (1080.0 * scale).round() as u32,
+        )
+    }
+
+    /// The bubble's centre on screen after being docked. The compact window *is*
+    /// the bubble's own box, so the centre is just half a window in from its top
+    /// left â€” there is no "where inside the window did the webview put it" any
+    /// more, which is what removed the drag limits.
+    fn centre(dock: &str, scale: f64) -> (i64, i64) {
+        let (wx, wy) = dock_position(dock, BUBBLE, screen(scale), scale);
+        // Half the **window**, not half the bubble: the bubble is centred inside a
+        // COMPACT_W box and the dock function returns where that box goes.
+        (
+            (wx as f64 / scale).round() as i64 + COMPACT_W as i64 / 2,
+            (wy as f64 / scale).round() as i64 + COMPACT_H as i64 / 2,
+        )
+    }
+
+    #[test]
+    fn the_bubble_lands_against_the_edge_it_was_docked_to() {
+        // The inset from the edge is the window's padding around the bubble, and
+        // the glow is drawn in exactly that padding — so the light reaches the
+        // edge of the screen even though the bubble itself stops short of it.
+        let pad = (COMPACT_W as i64 - BUBBLE.0) / 2;
+
+        let (cx, cy) = centre("left", 1.0);
+        assert_eq!(cx, BUBBLE.0 / 2 + pad, "left edge");
+        assert!((cy - 540).abs() <= 1, "left: {cx},{cy}");
+
+        let (cx, cy) = centre("right", 1.0);
+        assert_eq!(cx, 1920 - BUBBLE.0 / 2 - pad, "right edge");
+        assert!((cy - 540).abs() <= 1, "right: {cx},{cy}");
+
+        let (cx, cy) = centre("bottom", 1.0);
+        assert!((cx - 960).abs() <= 1, "bottom: {cx},{cy}");
+        assert_eq!(cy, 1080 - BUBBLE.1 / 2 - pad, "bottom edge");
+
+        let (cx, cy) = centre("top", 1.0);
+        assert!((cx - 960).abs() <= 1, "top: {cx},{cy}");
+        assert_eq!(cy, BUBBLE.1 / 2 + pad, "top edge");
+    }
+
+    #[test]
+    fn a_scaled_display_docks_to_the_same_place() {
+        // The webview thinks in CSS pixels and this code works in physical ones, so
+        // the conversion is exactly where a half-display offset would creep in.
+        for dock in ["left", "right", "top", "bottom"] {
+            let (cx, cy) = centre(dock, 1.5);
+            let (bx, by) = centre(dock, 1.0);
+            assert!(
+                (cx - bx).abs() <= 1 && (cy - by).abs() <= 1,
+                "{dock}: 1.5x gave {cx},{cy} against {bx},{by}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_window_reaches_both_sides_of_the_screen() {
+        // The reason the compact window is its own size rather than the panel's.
+        // Docked right, the window's right edge has to reach the display's right
+        // edge: a 720-wide window could not get anywhere near it, which is what
+        // made the drag feel walled in.
+        let (wx, _) = dock_position("right", BUBBLE, SCREEN, 1.0);
+        assert_eq!(
+            wx as i64 + COMPACT_W as i64,
+            1920,
+            "the window's glow reaches the right edge"
+        );
+        let (wx, _) = dock_position("left", BUBBLE, SCREEN, 1.0);
+        assert_eq!(wx, 0, "the window reaches the left edge");
+        // And the bubble stops short by exactly the glow's padding, not by more.
+        assert_eq!(
+            centre("left", 1.0).0,
+            BUBBLE.0 / 2 + (COMPACT_W as i64 - BUBBLE.0) / 2
+        );
+    }
+
+    #[test]
+    fn the_compact_window_holds_the_bubble_and_its_glow() {
+        // 104 for a 56 bubble: the glow is BUBBLE * 1.7 across and is drawn in
+        // this window, so a window sized to the bubble would clip it on every
+        // screen the bubble ever touched.
+        assert!(COMPACT_W as i64 >= BUBBLE.0);
+        assert!(COMPACT_H as i64 >= BUBBLE.1);
+        assert!(COMPACT_W < PANEL_W && COMPACT_H < PANEL_H);
+        // The slack has to be even, or the bubble is off-centre in its own window
+        // and sits a pixel further from one edge than the other.
+        assert_eq!((COMPACT_W as i64 - BUBBLE.0) % 2, 0, "even slack");
+        assert_eq!((COMPACT_H as i64 - BUBBLE.1) % 2, 0, "even slack");
+    }
+
+    #[test]
+    fn a_display_too_small_for_the_window_still_keeps_the_bubble_whole() {
+        let tiny = (0, 0, 40, 40);
+        let (wx, wy) = dock_position("bottom", BUBBLE, tiny, 1.0);
+        assert!(wx >= 0 && wy >= 0, "{wx},{wy}");
+    }
+
+    #[test]
+    fn an_unknown_dock_falls_back_to_the_top() {
+        assert_eq!(normalise_dock("nonsense"), "top");
+        assert_eq!(normalise_dock(""), "top");
+        assert_eq!(normalise_dock("  BOTTOM  "), "bottom");
+        assert_eq!(
+            dock_position("nonsense", BUBBLE, SCREEN, 1.0),
+            dock_position("top", BUBBLE, SCREEN, 1.0)
+        );
+    }
+}

@@ -1,0 +1,888 @@
+// Piko for Windows — app wiring and the commands the island calls.
+
+mod files;
+mod integrations;
+mod island;
+mod jsonc;
+mod log;
+mod mcp;
+mod mcpreg;
+mod mcpserver;
+mod notify;
+mod opencode;
+mod secrets;
+mod settings;
+mod tasks;
+mod tray;
+mod win_user;
+
+use std::os::windows::process::CommandExt;
+use std::process::Command;
+use std::sync::{Arc, Mutex};
+
+use serde::Serialize;
+use tauri::PhysicalPosition;
+use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
+use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
+
+use files::DroppedFile;
+use island::{PollGate, ScreenInfo};
+use opencode::Pending;
+use opencode::{Chat, ChatContext, ChatSent};
+use settings::Settings;
+
+/// Keeps spawned helpers from flashing a console window.
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+pub struct Shared {
+    pub settings: Mutex<Settings>,
+    pub gate: Arc<PollGate>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BootInfo {
+    settings: Settings,
+    screen: ScreenInfo,
+    version: String,
+}
+
+#[tauri::command]
+fn boot(app: AppHandle, shared: State<Shared>) -> BootInfo {
+    let mut settings = shared.settings.lock().unwrap().clone();
+    // OpenCode asks over HTTP and waits for the answer there, so there is no relay
+    // to tell and nothing to install: the field only existed for a `piko-hook.exe`
+    // that this build does not ship.
+    settings.hooks_installed = true;
+    let screen = island::screen_info(&app, &settings.screen);
+    BootInfo {
+        settings,
+        screen,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    }
+}
+
+#[tauri::command]
+fn save_settings(app: AppHandle, shared: State<Shared>, settings: Settings) {
+    let mut settings = settings;
+    // The master input switch is not one of these settings: `mcpserver` owns it,
+    // because it has to be able to turn itself off from a hotkey thread. A window
+    // holding a copy from before a kill would otherwise write "on" straight back
+    // over it, so the authoritative value always wins here.
+    settings.input_control_enabled = mcpserver::enabled();
+    // Same for where the island was dragged to: it is set from pointer moves, so
+    // any window holding a copy from before the drag would write the old spot
+    // straight back over the new one.
+    let (offset_x, offset_y, dock) = {
+        let current = shared.settings.lock().unwrap();
+        (
+            current.island_offset_x,
+            current.island_offset_y,
+            current.dock.clone(),
+        )
+    };
+    settings.island_offset_x = offset_x;
+    settings.island_offset_y = offset_y;
+    settings.dock = dock;
+    let (screen_changed, autostart_changed, managed_changed) = {
+        let mut current = shared.settings.lock().unwrap();
+        let screen_changed = current.screen != settings.screen;
+        let autostart_changed = current.autostart != settings.autostart;
+        let managed_changed = current.managed_server != settings.managed_server;
+        *current = settings.clone();
+        (screen_changed, autostart_changed, managed_changed)
+    };
+    if managed_changed {
+        // Turning managed mode off stops the server we started; turning it on
+        // starts one. Either way the switch takes effect now, not at next launch.
+        if settings.managed_server {
+            opencode::start_managed(app.clone());
+        } else {
+            opencode::stop_managed(&app);
+        }
+    }
+    if let Err(err) = settings::save(&settings) {
+        eprintln!("[piko] could not save settings: {err}");
+    }
+    if autostart_changed {
+        let manager = app.autolaunch();
+        let result = if settings.autostart {
+            manager.enable()
+        } else {
+            manager.disable()
+        };
+        if let Err(err) = result {
+            eprintln!("[piko] autostart: {err}");
+        }
+    }
+    if screen_changed {
+        island::apply_geometry(
+            &app,
+            &settings.screen,
+            shared.gate.shape(),
+            (offset_x, offset_y),
+        );
+    }
+    // Keep the other window in step (island ↔ settings window).
+    let _ = app.emit("settings-changed", settings);
+}
+
+/// Resizes the window to match what the island is doing.
+///
+/// Three shapes, not two: the panel, the collapsed bubble's own 104×104 window,
+/// and the hidden wake strip. The bubble used to be drawn inside the 720-wide
+/// panel window, which is what made dragging it feel like it hit walls — a window
+/// that wide cannot slide far enough for the bubble inside it to reach either
+/// side of a 1280-wide screen.
+///
+/// The strip parks the cursor poll, because from a 240×6 window the OS delivers
+/// no cursor events and there is nothing to poll for.
+#[tauri::command]
+fn set_island_shape(app: AppHandle, shared: State<Shared>, shape: String) {
+    let shape = match shape.as_str() {
+        "panel" => island::Shape::Panel,
+        "bubble" => island::Shape::Bubble,
+        _ => island::Shape::Strip,
+    };
+    let (pref, offset) = {
+        let s = shared.settings.lock().unwrap();
+        (s.screen.clone(), (s.island_offset_x, s.island_offset_y))
+    };
+    shared.gate.set_shape(shape);
+    island::apply_geometry(&app, &pref, shape, offset);
+    // The wake strip must always take the mouse, and a resize invalidates the flag.
+    island::set_ignore_cursor(&app, false);
+    shared.gate.forget_ignore_state();
+    shared.gate.set_active(shape != island::Shape::Strip);
+}
+
+/// The front end pushes the island shape; Rust decides click-through from it.
+#[tauri::command]
+fn set_island_rect(shared: State<Shared>, x: f64, y: f64, width: f64, height: f64) {
+    shared.gate.set_rect(island::IslandRect {
+        x,
+        y,
+        w: width,
+        h: height,
+    });
+}
+
+#[tauri::command]
+fn focus_window(app: AppHandle, focused: bool) {
+    let Some(win) = island::window(&app) else {
+        return;
+    };
+    island::set_activating(&win, focused);
+    if focused {
+        let _ = win.set_focus();
+    }
+}
+
+#[tauri::command]
+fn reposition(app: AppHandle, shared: State<Shared>) {
+    let (pref, offset) = {
+        let s = shared.settings.lock().unwrap();
+        (s.screen.clone(), (s.island_offset_x, s.island_offset_y))
+    };
+    island::apply_geometry(&app, &pref, shared.gate.shape(), offset);
+}
+
+// ── Moving the island ─────────────────────────────────────────────────────────
+//
+// The header is the drag handle. The front end only reports where the pointer
+// is; every pixel of arithmetic happens here, in physical pixels, because the
+// display's scale is not something a webview can work out for itself.
+//
+// A drag has to survive the island being collapsed and reopened afterwards, so
+// the result is stored as an offset from the spot the island would otherwise sit
+// in, and `apply_geometry` re-applies it. Nothing is written to disk until the
+// drag ends: a pointer move every 16 ms would otherwise thrash the settings file.
+
+/// The island's top-left in CSS pixels, to turn a pointer delta into a target.
+#[tauri::command]
+fn island_position(app: AppHandle) -> Option<(f64, f64)> {
+    island::position_css(&app)
+}
+
+/// A drag has begun: keep taking the mouse even where the island used to be.
+#[tauri::command]
+fn island_drag_start(app: AppHandle, shared: State<Shared>) {
+    shared.gate.set_dragging(true);
+    island::set_ignore_cursor(&app, false);
+}
+
+/// Moves the island to `x`/`y` in CSS pixels and remembers where that is.
+#[tauri::command]
+fn island_drag_to(app: AppHandle, shared: State<Shared>, x: f64, y: f64) {
+    let pref = shared.settings.lock().unwrap().screen.clone();
+    let Some((ox, oy)) = island::move_to_css(&app, &pref, x, y) else {
+        return;
+    };
+    let mut settings = shared.settings.lock().unwrap();
+    settings.island_offset_x = ox;
+    settings.island_offset_y = oy;
+}
+
+/// The drag is over: release the mouse and write the new position down once.
+#[tauri::command]
+fn island_drag_end(app: AppHandle, shared: State<Shared>) {
+    shared.gate.set_dragging(false);
+    island::set_ignore_cursor(&app, false);
+    let settings = shared.settings.lock().unwrap().clone();
+    if let Err(err) = settings::save(&settings) {
+        eprintln!("[piko] could not save the island position: {err}");
+    }
+}
+
+/// Back to the middle of the top edge.
+#[tauri::command]
+fn island_recenter(app: AppHandle, shared: State<Shared>) {
+    {
+        let mut settings = shared.settings.lock().unwrap();
+        settings.island_offset_x = 0;
+        settings.island_offset_y = 0;
+        settings.dock = "top".into();
+    }
+    island_drag_end(app.clone(), shared.clone());
+    let pref = shared.settings.lock().unwrap().screen.clone();
+    island::apply_geometry(&app, &pref, island::Shape::Panel, (0, 0));
+}
+
+/// Where the island window is, and how big the display it is on, in CSS pixels.
+#[tauri::command]
+fn island_geometry(app: AppHandle, shared: State<Shared>) -> Option<IslandGeometry> {
+    let pref = shared.settings.lock().unwrap().screen.clone();
+    let win = island::window(&app)?;
+    let m = island::target_monitor_pub(&app, &pref)?;
+    let scale = win.scale_factor().ok()?;
+    let pos = win.outer_position().ok()?;
+    let size = win.outer_size().ok()?;
+    let mp = *m.position();
+    Some(IslandGeometry {
+        win_x: pos.x as f64 / scale,
+        win_y: pos.y as f64 / scale,
+        win_w: size.width as f64 / scale,
+        win_h: size.height as f64 / scale,
+        mon_x: mp.x as f64 / scale,
+        mon_y: mp.y as f64 / scale,
+        mon_w: m.size().width as f64 / scale,
+        mon_h: m.size().height as f64 / scale,
+    })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IslandGeometry {
+    win_x: f64,
+    win_y: f64,
+    win_w: f64,
+    win_h: f64,
+    mon_x: f64,
+    mon_y: f64,
+    mon_w: f64,
+    mon_h: f64,
+}
+
+/// Docks the collapsed bubble to a screen edge and remembers it.
+///
+/// The webview reports where it drew the bubble inside the window, because that
+/// is a webview decision and Rust has no way to know it. Rust answers with where
+/// the window has to go, in physical pixels.
+#[tauri::command]
+fn island_dock(
+    app: AppHandle,
+    shared: State<Shared>,
+    dock: String,
+    bubble_size: f64,
+    _island_x: f64,
+    _island_y: f64,
+) {
+    let pref = shared.settings.lock().unwrap().screen.clone();
+    let dock = island::normalise_dock(&dock);
+    let Some(win) = island::window(&app) else {
+        return;
+    };
+    let Some(m) = island::target_monitor_pub(&app, &pref) else {
+        return;
+    };
+    let scale = win.scale_factor().unwrap_or(1.0);
+    let mp = *m.position();
+    let (x, y) = island::dock_position(
+        dock,
+        (bubble_size.round() as i64, bubble_size.round() as i64),
+        (mp.x, mp.y, m.size().width, m.size().height),
+        scale,
+    );
+    {
+        let mut settings = shared.settings.lock().unwrap();
+        settings.dock = dock.into();
+        // The offset is derived from the dock, so recomputing it here rather than
+        // leaving a stale drag distance to be applied on top of it.
+        settings.island_offset_x = x;
+        settings.island_offset_y = y;
+    }
+    let _ = win.set_position(PhysicalPosition::new(x, y));
+    let settings = shared.settings.lock().unwrap().clone();
+    if let Err(err) = settings::save(&settings) {
+        eprintln!("[piko] could not save the dock: {err}");
+    }
+}
+
+#[tauri::command]
+fn open_url(url: String) {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return;
+    }
+    let _ = Command::new("rundll32.exe")
+        .args(["url.dll,FileProtocolHandler", &url])
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn();
+}
+
+/// "Open terminal" opens the working folder in VS Code when `code` is on PATH,
+/// and falls back to Explorer otherwise.
+#[tauri::command]
+fn open_in_vscode(path: Option<String>) -> bool {
+    // No `cmd /C` anywhere near this. The path is a project folder chosen by
+    // whoever is using Claude Code, and cmd would happily read `&`, `^` and `%`
+    // in a folder name as syntax. Finding the launcher ourselves and handing the
+    // path over as a separate argument keeps it a path.
+    if let Some(code) = find_on_path("code") {
+        let mut cmd = Command::new(code);
+        if let Some(p) = path.as_deref().filter(|p| !p.is_empty()) {
+            cmd.arg(p);
+        }
+        if cmd.creation_flags(CREATE_NO_WINDOW).spawn().is_ok() {
+            return true;
+        }
+    }
+    if let Some(p) = path.as_deref().filter(|p| !p.is_empty()) {
+        let _ = Command::new("explorer").arg(p).spawn();
+    }
+    false
+}
+
+/// Our own `where`: walks %PATH% against %PATHEXT%, no shell involved.
+/// Rust quotes arguments correctly for `.cmd`/`.bat` targets since 1.77, so
+/// spawning `code.cmd` directly is safe.
+fn find_on_path(stem: &str) -> Option<std::path::PathBuf> {
+    let exts = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+    let dirs = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&dirs) {
+        for ext in exts.split(';').filter(|e| !e.is_empty()) {
+            let candidate = dir.join(format!("{stem}{}", ext.to_lowercase()));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+#[tauri::command]
+fn quit_app(app: AppHandle) {
+    app.exit(0);
+}
+
+/// Tray → Pause. Paused means paused: the pollers stop talking to the network,
+/// not just the island stopping showing things.
+#[tauri::command]
+fn set_paused(paused: bool) {
+    integrations::set_paused(paused);
+}
+
+// ── Claude Code hooks ─────────────────────────────────────────────────────────
+
+/// "Test connection" in settings → OpenCode version, or a readable error.
+#[tauri::command]
+async fn opencode_test(app: AppHandle) -> Result<String, String> {
+    opencode::test(app).await
+}
+
+/// "Auto-detect" in settings → first healthy default URL, if any.
+#[tauri::command]
+async fn opencode_detect() -> Option<String> {
+    opencode::detect().await
+}
+
+// ── Tasks ──────────────────────────────────────────────────────────────────────
+
+/// Starts a task: a new OpenCode session in `directory`, driven asynchronously so
+/// several can run at once. Returns as soon as the prompt is accepted.
+#[tauri::command]
+async fn task_start(
+    app: AppHandle,
+    shared: State<'_, Shared>,
+    directory: String,
+    prompt: String,
+    agent: Option<String>,
+    kind: Option<String>,
+) -> Result<tasks::TaskInfo, String> {
+    // No agent chosen means the server's own default, which is what `GET /agent`
+    // reports first — sending an empty string would ask for an agent named "".
+    let agent = agent.filter(|a| !a.trim().is_empty()).or_else(|| {
+        Some(shared.settings.lock().unwrap().task_agent.clone()).filter(|a| !a.is_empty())
+    });
+    tasks::start(
+        &app,
+        tasks::StartRequest {
+            directory,
+            prompt,
+            agent,
+            kind,
+        },
+    )
+    .await
+}
+
+/// The folders the picker should offer, most recent first.
+#[tauri::command]
+fn task_folders() -> Vec<String> {
+    tasks::recent_folders()
+}
+
+#[tauri::command]
+fn task_list(app: AppHandle) -> Vec<tasks::TaskInfo> {
+    tasks::list(&app)
+}
+
+#[tauri::command]
+async fn task_abort(app: AppHandle, id: String) -> Result<(), String> {
+    tasks::abort(&app, &id).await
+}
+
+/// Sends a message to the same session, which is what makes a finished task
+/// continuable instead of a dead end.
+#[tauri::command]
+async fn task_followup(app: AppHandle, id: String, text: String) -> Result<(), String> {
+    tasks::followup(&app, &id, &text).await
+}
+
+/// `GET /agent`, default first. Never asks for a model list — that would mean
+/// reading the provider config.
+#[tauri::command]
+async fn task_agents() -> Result<Vec<tasks::AgentInfo>, String> {
+    tasks::agents().await
+}
+
+/// "Open in OpenCode": the TUI, already sitting on that session.
+///
+/// `opencode [project] --session <id>` is the documented way to resume one
+/// session (1.18.34: `-s, --session  session id to continue`), so the folder goes
+/// first as the positional project argument.
+#[tauri::command]
+fn task_open(app: AppHandle, id: String) -> String {
+    let Some(task) = app.state::<tasks::Registry>().lookup(&id) else {
+        return "That task is no longer known to Piko.".into();
+    };
+    if let Some(bin) = find_on_path("opencode") {
+        let mut cmd = Command::new(bin);
+        cmd.arg(&task.directory).arg("--session").arg(&task.session);
+        if cmd.creation_flags(CREATE_NO_WINDOW).spawn().is_ok() {
+            return String::new();
+        }
+    }
+    // Nothing to resume with, so at least open the folder the task ran in.
+    let _ = Command::new("explorer").arg(&task.directory).spawn();
+    "Opened the folder instead — the OpenCode CLI isn't on PATH.".into()
+}
+
+/// The folder picker behind "Choose a folder". Deliberately *not* `async`: the
+/// dialog blocks, and a blocking call on the async runtime would stall the task
+/// commands that share it. On the main thread it blocks only the UI, which is
+/// what a modal dialog is supposed to do.
+#[tauri::command]
+fn pick_folder(app: AppHandle) -> Option<String> {
+    use tauri_plugin_dialog::DialogExt;
+    app.dialog()
+        .file()
+        .set_title("Choose a folder to work in")
+        .blocking_pick_folder()
+        .and_then(|p| p.into_path().ok())
+        .map(|p| p.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn approval_decision(app: AppHandle, request_id: String, decision: String) {
+    opencode::answer(&app, &request_id, &decision);
+}
+
+/// Nobody can act on this request — the island is paused, or another card is
+/// already up. OpenCode falls back to asking in the terminal immediately.
+#[tauri::command]
+fn approval_decline(app: AppHandle, request_id: String) {
+    opencode::decline(&app, &request_id);
+}
+
+// ── Chat, files and secrets ───────────────────────────────────────────────────
+
+/// One chat turn. The API key and any file bytes stay on the Rust side.
+/// `agent` is the OpenCode agent to answer with; empty means the server default.
+#[tauri::command]
+async fn chat_send(
+    shared: State<'_, Shared>,
+    chat: State<'_, Chat>,
+    query: String,
+    context: Option<ChatContext>,
+    agent: Option<String>,
+) -> Result<ChatSent, String> {
+    let _ = &shared;
+    opencode::send(&chat, query, context, agent).await
+}
+
+#[tauri::command]
+fn chat_reset(chat: State<Chat>) {
+    chat.reset();
+}
+
+/// Stops the turn in flight, so the island's Stop button ends it rather than only
+/// reporting on it.
+#[tauri::command]
+async fn chat_stop(chat: State<'_, Chat>) -> Result<(), String> {
+    opencode::abort_chat(&chat).await
+}
+
+/// Copies a dropped file into the inbox and reports its name back.
+#[tauri::command]
+fn ingest_file(path: String) -> Result<DroppedFile, String> {
+    files::ingest(&path)
+}
+
+/// The island may only ask whether a key exists — never read it.
+#[tauri::command]
+fn secret_present(key: String) -> bool {
+    secrets::present(&key)
+}
+
+/// How many integration keys are stored. Presence only, never the keys and never
+/// their values: the badge on the settings card says "there are some", which is all
+/// it has any business saying.
+#[tauri::command]
+fn secret_stored_count() -> usize {
+    secrets::stored_count()
+}
+
+#[tauri::command]
+fn secret_set(key: String, value: String) -> Result<(), String> {
+    secrets::set(&key, &value)
+}
+
+#[tauri::command]
+fn secret_clear(key: String) -> Result<(), String> {
+    secrets::clear(&key)
+}
+
+/// Opens the configured n8n instance — the URL lives in the Credential Manager.
+#[tauri::command]
+fn open_n8n() {
+    if let Some(url) = secrets::get("n8n-url") {
+        open_url(url);
+    }
+}
+
+/// Refresh buttons in the integration cards.
+#[tauri::command]
+async fn refresh_integration(app: AppHandle, id: String) {
+    integrations::poll_once(app, &id).await;
+}
+
+/// Lets the island write to the same log as the Rust side.
+#[tauri::command]
+fn log_line(message: String) {
+    log::line(format!("ui  {message}"));
+}
+
+// ── Settings window ───────────────────────────────────────────────────────────
+
+/// WebView2 allows exactly one browser environment per app, and its options are
+/// fixed by whichever webview is created first. Every window must therefore ask
+/// for the *same* arguments as the island (see `additionalBrowserArgs` in
+/// tauri.conf.json) — a mismatch makes the second window come up blank, with no
+/// error anywhere.
+const BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required";
+
+/// In a dev build the pages are served by Vite, so the second window needs the
+/// absolute dev URL; a bundled build resolves it inside the app bundle.
+fn settings_page_url(app: &AppHandle) -> WebviewUrl {
+    #[cfg(dev)]
+    if let Some(mut base) = app.config().build.dev_url.clone() {
+        base.set_path("/settings.html");
+        return WebviewUrl::External(base);
+    }
+    let _ = app;
+    WebviewUrl::App("settings.html".into())
+}
+
+/// The settings window is created hidden at launch and only ever shown and
+/// hidden afterwards. A WebView2 window created later — on the main thread or
+/// not — silently comes up blank in this app, so the window that works is the
+/// one that exists before the island's webview does.
+fn create_settings_window(app: &AppHandle) {
+    let url = settings_page_url(app);
+    match WebviewWindowBuilder::new(app, "settings", url)
+        .additional_browser_args(BROWSER_ARGS)
+        .title("Settings — Piko")
+        .inner_size(560.0, 680.0)
+        .min_inner_size(460.0, 480.0)
+        .resizable(true)
+        .visible(false)
+        .center()
+        .build()
+    {
+        Ok(win) => {
+            // Closing it must only hide it, or it could never be reopened.
+            let hidden = win.clone();
+            let app = app.clone();
+            win.on_window_event(move |event| {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = hidden.hide();
+                    // The island is always-on-top, so it has to step aside for the
+                    // settings window and come back when it closes. Both edges are
+                    // reported from here; the tray path goes through
+                    // `show_settings_window` and cannot be seen from the island.
+                    let _ = app.emit_to(island::WINDOW_LABEL, "settings-open", false);
+                }
+            });
+        }
+        Err(err) => log::line(format!("settings window failed: {err}")),
+    }
+}
+
+pub fn show_settings_window(app: &AppHandle) {
+    let Some(win) = app.get_webview_window("settings") else {
+        log::line("settings window missing");
+        return;
+    };
+    let _ = win.unminimize();
+    let _ = win.show();
+    let _ = win.set_focus();
+    // See `create_settings_window`: the island is always-on-top and has to be told
+    // to get out of the way, whichever way the settings window was opened.
+    let _ = app.emit_to(island::WINDOW_LABEL, "settings-open", true);
+}
+
+#[tauri::command]
+fn open_settings_window(app: AppHandle) {
+    show_settings_window(&app);
+}
+
+/// Entry point for `piko.exe mcp`. Separate from `run` on purpose: the bridge
+/// must never start a window, a tray or the single-instance guard.
+pub fn mcp_bridge() -> i32 {
+    mcpserver::run_stdio_bridge()
+}
+
+// ── MCP commands ──────────────────────────────────────────────────────────────
+//
+// Thin wrappers only. Every rule lives in mcpserver::approve, so there is exactly
+// one place where an action can be allowed and it is not reachable from the
+// webview.
+
+#[tauri::command]
+fn mcp_status() -> mcpserver::Status {
+    mcpserver::status()
+}
+
+#[tauri::command]
+fn mcp_set_enabled(app: AppHandle, enabled: bool) -> mcpserver::Status {
+    // Persisted inside mcpserver, by the same writer the kill switch uses, so the
+    // flag can never disagree with itself. The webview is told the new status
+    // rather than being trusted as the source of truth.
+    mcpserver::set_enabled(&app, enabled)
+}
+
+#[tauri::command]
+fn mcp_answer(app: AppHandle, id: String, allow: bool, session: bool) -> bool {
+    mcpserver::answer(&app, &id, allow, session)
+}
+
+/// The kill switch, reachable from the island as well as the hotkey. Same path
+/// either way: everything stops and the switch goes off.
+#[tauri::command]
+fn mcp_kill(app: AppHandle) -> mcpserver::Status {
+    mcpserver::kill(&app)
+}
+
+/// True when Ctrl+Alt+Shift+Esc is armed in this process. Checked before the
+/// switch is offered, so a machine where another app owns the chord says so
+/// rather than being a surprise.
+#[tauri::command]
+fn mcp_kill_hotkey_available() -> bool {
+    mcpserver::kill_hotkey_armed()
+}
+
+/// The registration diff. Called on open and again before the write, so what the
+/// user approves is what gets written.
+#[tauri::command]
+fn mcp_register_plan() -> Result<mcpreg::Plan, String> {
+    mcpreg::plan()
+}
+
+/// Writes the registration, but only if `digest` is still the change on record.
+///
+/// The digest comes from the plan that was rendered, so a config edited behind
+/// the window's back makes the write fail and say why, rather than applying a
+/// diff that was never displayed.
+#[tauri::command]
+fn mcp_register_apply(app: AppHandle, digest: String) -> Result<String, String> {
+    let backup = mcpreg::apply(&digest)?;
+    mcpserver::set_registered(&app, true);
+    log::line(format!(
+        "registered piko mcp in opencode.json (backup: {backup})"
+    ));
+    Ok(backup)
+}
+
+#[tauri::command]
+fn mcp_register_remove(app: AppHandle) -> Result<Option<String>, String> {
+    let backup = mcpreg::remove()?;
+    mcpserver::set_registered(&app, false);
+    log::line("removed piko mcp from opencode.json");
+    Ok(backup)
+}
+
+pub fn run() {
+    let loaded = settings::load();
+    let gate = Arc::new(PollGate::new());
+
+    tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            let _ = app.emit_to(island::WINDOW_LABEL, "tray", "open".to_string());
+        }))
+        .plugin(tauri_plugin_autostart::init(
+            MacosLauncher::LaunchAgent,
+            None,
+        ))
+        .plugin(tauri_plugin_dialog::init())
+        .manage(Shared {
+            settings: Mutex::new(loaded.clone()),
+            gate: gate.clone(),
+        })
+        .manage(Pending::default())
+        .manage(Chat::default())
+        .manage(std::sync::Arc::new(opencode::Managed::new()))
+        .manage(tasks::Registry::default())
+        .invoke_handler(tauri::generate_handler![
+            boot,
+            save_settings,
+            set_island_shape,
+            set_island_rect,
+            focus_window,
+            reposition,
+            island_position,
+            island_drag_start,
+            island_drag_to,
+            island_drag_end,
+            island_recenter,
+            island_dock,
+            island_geometry,
+            open_url,
+            open_in_vscode,
+            quit_app,
+            opencode_test,
+            opencode_detect,
+            approval_decision,
+            approval_decline,
+            log_line,
+            chat_send,
+            chat_stop,
+            chat_reset,
+            ingest_file,
+            secret_present,
+            secret_stored_count,
+            secret_set,
+            secret_clear,
+            refresh_integration,
+            open_n8n,
+            open_settings_window,
+            set_paused,
+            task_start,
+            task_list,
+            task_folders,
+            task_abort,
+            task_followup,
+            task_agents,
+            task_open,
+            pick_folder,
+            mcp_status,
+            mcp_set_enabled,
+            mcp_answer,
+            mcp_kill,
+            mcp_kill_hotkey_available,
+            mcp_register_plan,
+            mcp_register_apply,
+            mcp_register_remove,
+        ])
+        .setup(move |app| {
+            let handle = app.handle().clone();
+            #[cfg(feature = "toast")]
+            app.handle().plugin(tauri_plugin_notification::init())?;
+            tray::build(&handle)?;
+            // Probes whether a toast host will take one, then clears the badge.
+            // After the tray so the badge call has an icon to find.
+            notify::init(&handle);
+            tray::set_badge(&handle, 0);
+            // Before the island: see create_settings_window.
+            create_settings_window(&handle);
+
+            if let Some(win) = island::window(&handle) {
+                island::make_non_activating(&win);
+                island::apply_geometry(
+                    &handle,
+                    &loaded.screen,
+                    island::Shape::Panel,
+                    (loaded.island_offset_x, loaded.island_offset_y),
+                );
+                let _ = win.show();
+            }
+            gate.set_shape(island::Shape::Panel);
+            gate.set_active(true);
+            island::spawn_cursor_poll(handle.clone(), gate.clone());
+
+            log::line(format!(
+                "--- Piko {} started ---",
+                env!("CARGO_PKG_VERSION")
+            ));
+            opencode::start_managed(handle.clone());
+            opencode::start(handle.clone());
+            integrations::start(handle.clone());
+            // The kill chord first: it is the one thing that must be live before
+            // anything can ask to touch the screen.
+            mcpserver::start_kill_hotkey(handle.clone());
+            // Off until someone turns it on, and every grant from a previous run
+            // dropped — see mcpserver::start.
+            mcpserver::start();
+            // Only then does the saved choice come back into force. A persisted
+            // "on" is honoured; a persisted "off" (and every fresh install) leaves
+            // the switch off.
+            if loaded.input_control_enabled {
+                mcpserver::set_enabled(&handle, true);
+            }
+            // Whether OpenCode knows about us, read from its config rather than
+            // remembered by us, so it survives someone editing the file by hand.
+            mcpserver::set_registered(&handle, mcpreg::registered());
+            // The pipe the `piko mcp` bridge connects to. Started after the
+            // island exists so the first approval has somewhere to appear.
+            mcpserver::serve(handle.clone());
+            // Finished tasks stay on the overview for an hour, then go.
+            {
+                let handle = handle.clone();
+                std::thread::spawn(move || loop {
+                    std::thread::sleep(std::time::Duration::from_secs(5 * 60));
+                    tasks::sweep(&handle, 60 * 60 * 1000);
+                });
+            }
+            Ok(())
+        })
+        .build(tauri::generate_context!())
+        .expect("error while building Piko")
+        .run(|app, event| {
+            // The OpenCode server this process started is a child of this process:
+            // leaving it behind would mean the next launch finds a port held by a
+            // server nobody is looking after.
+            if let tauri::RunEvent::Exit = event {
+                opencode::shutdown_managed(app);
+            }
+        });
+}

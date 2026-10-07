@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="400" height="400" xmlns:c2pa="http://c2pa.org/manifest"><path d="M100 52 L100 30" fill="none" stroke="#231f20" stroke-width="6" stroke-linejoin="round" stroke-linecap="round"/><circle cx="100" cy="24" r="10" fill="#ff7a8a" stroke="#231f20" stroke-width="6" stroke-linejoin="round" stroke-linecap="round"/>
+<rect x="14" y="94" width="20" height="38" rx="8" fill="#6fcfba" stroke="#231f20" stroke-width="6" stroke-linejoin="round" stroke-linecap="round"/><rect x="166" y="94" width="20" height="38" rx="8" fill="#6fcfba" stroke="#231f20" stroke-width="6" stroke-linejoin="round" stroke-linecap="round"/>
+<rect x="28" y="50" width="144" height="120" rx="32" fill="#9fe3d0" stroke="#231f20" stroke-width="6" stroke-linejoin="round" stroke-linecap="round"/>
+<rect x="46" y="78" width="108" height="68" rx="24" fill="#1f2a33" stroke="#231f20" stroke-width="6" stroke-linejoin="round" stroke-linecap="round"/>
+<rect x="64" y="98" width="20" height="26" rx="10" fill="#7ff3ff"/><rect x="116" y="98" width="20" height="26" rx="10" fill="#7ff3ff"/>
+<path d="M90 134 Q100 141 110 134" fill="none" stroke="#7ff3ff" stroke-width="5" stroke-linecap="round"/>
+<circle cx="50" cy="160" r="0"/></svg>
