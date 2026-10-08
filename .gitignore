@@ -11,3 +11,9 @@ src-tauri/gen/schemas/
 .env
 .env.*
 !.env.example
+
+# fix-mojibake.mjs writes these next to the files it repairs. They are much older
+# revisions of them and match almost every symbol search, so they never belong in
+# the source tree; kept out of the way under .scratch/ instead.
+*.mojibake-bak
+.scratch/
