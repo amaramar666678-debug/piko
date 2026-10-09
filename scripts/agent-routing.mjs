@@ -54,7 +54,6 @@ const SETTINGS = {
   // fall back to OpenCode's own default rather than to nothing.
   taskAgent: "",
   chatAgent: "",
-  managedServer: true,
   characterId: "robot",
   islandOffsetX: 0,
   islandOffsetY: 0,
@@ -132,6 +131,12 @@ const RECORDER = `
             version: "0.1.1", hookPath: "",
           });
         case "task_agents": return Promise.resolve(AGENTS);
+        // A server that lists agents is a healthy server. Without this the new
+        // connection check reads the default arm as "unknown", draws the room as
+        // disconnected, and the test would be measuring its own stub.
+        case "opencode_health": return Promise.resolve({
+          ok: true, url: "http://127.0.0.1:4096", version: "1.18.34",
+        });
         case "task_list": return Promise.resolve([]);
         case "task_folders": return Promise.resolve([]);
         case "mcp_status": return Promise.resolve({

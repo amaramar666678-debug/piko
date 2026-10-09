@@ -214,7 +214,12 @@ fn status_hint(status: StatusCode) -> String {
 }
 
 fn unreachable(e: reqwest::Error) -> String {
-    format!("OpenCode unreachable ({})", e.without_url())
+    // The whole chain, not `without_url()`: "error sending request" is only the top
+    // of a reqwest error, and the reason it failed is underneath it. Logged verbatim
+    // so the log file can answer what went wrong where the UI can only paraphrase.
+    let detail = format!("{e:#}");
+    crate::log::line(&format!("opencode task request failed: {detail}"));
+    format!("OpenCode unreachable ({detail})")
 }
 
 // ── starting a task ────────────────────────────────────────────────────────────

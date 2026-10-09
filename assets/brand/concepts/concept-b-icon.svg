@@ -1,0 +1,30 @@
+<!--
+  Piko — concept B on an app-icon tile. Scaled about the mark's own centre so the
+  notch keeps its depth and does not clip against the tile edge.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="b-tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1B1C22"/>
+      <stop offset="1" stop-color="#121317"/>
+    </linearGradient>
+    <mask id="b-icon-cut" maskUnits="userSpaceOnUse" x="0" y="0" width="512" height="512">
+      <rect width="512" height="512" fill="#FFFFFF"/>
+      <rect x="208" y="56" width="96" height="80" rx="20" fill="#000000"/>
+      <circle cx="196" cy="272" r="34" fill="#000000"/>
+      <circle cx="316" cy="272" r="34" fill="#000000"/>
+    </mask>
+  </defs>
+  <rect width="512" height="512" rx="116" fill="url(#b-tile)"/>
+  <rect x="2" y="2" width="508" height="508" rx="114" fill="none" stroke="#FFFFFF" stroke-opacity="0.08" stroke-width="4"/>
+  <g transform="translate(256 244) scale(0.86) translate(-256 -244)">
+    <path fill="#FFFFFF" mask="url(#b-icon-cut)" d="
+      M432,256
+      C432,383 383,432 256,432
+      C129,432 80,383 80,256
+      C80,129 129,80 256,80
+      C383,80 432,129 432,256
+      Z
+    "/>
+  </g>
+</svg>

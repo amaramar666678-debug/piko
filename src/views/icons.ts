@@ -37,6 +37,7 @@ export const ICONS = {
   arrowUpRight: "M8.5 7h8.5v8.5h-2V10.4l-7.1 7.1-1.4-1.4 7.1-7.1H8.5V7z",
   // chevron.right
   chevronRight: "M9 5.5 15.5 12 9 18.5",
+  chevronDown: "M5.5 9 12 15.5 18.5 9",
   chevronLeft: "M15 5.5 8.5 12 15 18.5",
   // checkmark
   check: "M5 12.5 9.5 17 19 7.5",

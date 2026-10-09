@@ -84,23 +84,13 @@ fn save_settings(app: AppHandle, shared: State<Shared>, settings: Settings) {
     settings.island_offset_x = offset_x;
     settings.island_offset_y = offset_y;
     settings.dock = dock;
-    let (screen_changed, autostart_changed, managed_changed) = {
+    let (screen_changed, autostart_changed) = {
         let mut current = shared.settings.lock().unwrap();
         let screen_changed = current.screen != settings.screen;
         let autostart_changed = current.autostart != settings.autostart;
-        let managed_changed = current.managed_server != settings.managed_server;
         *current = settings.clone();
-        (screen_changed, autostart_changed, managed_changed)
+        (screen_changed, autostart_changed)
     };
-    if managed_changed {
-        // Turning managed mode off stops the server we started; turning it on
-        // starts one. Either way the switch takes effect now, not at next launch.
-        if settings.managed_server {
-            opencode::start_managed(app.clone());
-        } else {
-            opencode::stop_managed(&app);
-        }
-    }
     if let Err(err) = settings::save(&settings) {
         eprintln!("[piko] could not save settings: {err}");
     }
@@ -339,6 +329,178 @@ fn open_url(url: String) {
         .spawn();
 }
 
+// ── "Open in…" ───────────────────────────────────────────────────────────────
+//
+// One place decides what this machine can open a project folder in, and one
+// place starts it. Everything here is a path we looked for ourselves and a
+// separate argument; nothing is ever assembled into a command line, so a folder
+// called `work & play` is a folder and not a syntax error. Nothing that reaches
+// these two functions comes from a chat message or a model: the only inputs are
+// the id the island sent, which is matched against a fixed list, and a folder the
+// user picked or that came out of the task registry.
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenTarget {
+    id: String,
+    label: String,
+}
+
+/// Where VS Code lives when it is installed but not on PATH.
+///
+/// `code` on PATH is the documented way in, but the Windows installer does not
+/// put it there for a per-user install — `App Paths` is not consulted because
+/// reading the registry for a path we can simply look for on disk is not worth
+/// the code, and these two directories are where that installer puts it.
+fn vscode_exe() -> Option<std::path::PathBuf> {
+    if let Some(code) = find_on_path("code") {
+        return Some(code);
+    }
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    for var in ["LOCALAPPDATA", "ProgramFiles", "ProgramW6432"] {
+        if let Some(base) = std::env::var_os(var) {
+            let base = std::path::PathBuf::from(base);
+            roots.push(base.join("Programs/Microsoft VS Code"));
+            roots.push(base.join("Microsoft VS Code"));
+        }
+    }
+    roots
+        .into_iter()
+        .map(|dir| dir.join("Code.exe"))
+        .find(|exe| exe.is_file())
+}
+
+/// The OpenCode desktop app, if this machine has it.
+///
+/// The installer chooses the folder name, so the glob is `bin/*` under the
+/// package root rather than a hardcoded executable name: npm scopes are written
+/// `@opencode-aidesktop` here today and nothing promises that forever.
+fn opencode_desktop() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from)?;
+    let programs = base.join("Programs");
+    let entries = std::fs::read_dir(&programs).ok()?;
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        let name = dir.file_name()?.to_string_lossy().to_string();
+        if !name.to_lowercase().starts_with("opencode") {
+            continue;
+        }
+        let exe = dir.join("OpenCode.exe");
+        if exe.is_file() {
+            return Some(exe);
+        }
+    }
+    None
+}
+
+/// Windows Terminal, which is the only honest way to show a TUI: the CLI is a
+/// console program, so starting it with `CREATE_NO_WINDOW` would show nothing at
+/// all. `cmd /c start …` would work too, and is exactly the kind of assembled
+/// command line this file refuses to build.
+fn windows_terminal() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from)?;
+    let wt = base.join("Microsoft/WindowsApps/wt.exe");
+    wt.is_file().then_some(wt)
+}
+
+/// What this machine can actually open a folder in, in the order shown.
+#[tauri::command]
+fn open_targets() -> Vec<OpenTarget> {
+    let mut out = Vec::new();
+    if vscode_exe().is_some() {
+        out.push(OpenTarget {
+            id: "vscode".into(),
+            label: "VS Code".into(),
+        });
+    }
+    if opencode_desktop().is_some() {
+        out.push(OpenTarget {
+            id: "opencode-app".into(),
+            label: "OpenCode".into(),
+        });
+    }
+    if opencode::cli().is_some() && windows_terminal().is_some() {
+        out.push(OpenTarget {
+            id: "opencode-cli".into(),
+            label: "OpenCode (terminal)".into(),
+        });
+    }
+    out
+}
+
+/// The folder to open: the one asked for, or the last project a task ran in.
+///
+/// There is no default folder. Opening `%APPDATA%\Piko` behind someone's back is
+/// how "Open in…" ends up showing an empty directory and looking broken; when
+/// nothing is known the caller is told so and asks.
+fn folder_for(path: Option<String>) -> Result<std::path::PathBuf, String> {
+    let asked = path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(std::path::PathBuf::from);
+    if let Some(dir) = asked {
+        // A NUL cannot reach here from the UI, but a path that cannot exist is
+        // refused rather than passed on to a spawn.
+        if !dir.is_dir() {
+            return Err(format!("{} is not a folder", dir.display()));
+        }
+        return Ok(dir);
+    }
+    tasks::recent_folders()
+        .into_iter()
+        .next()
+        .map(std::path::PathBuf::from)
+        .filter(|dir| dir.is_dir())
+        .ok_or_else(|| "no folder chosen yet".to_string())
+}
+
+/// Opens `folder` in `target`. Returns what it actually launched, for the log.
+#[tauri::command]
+fn open_in(target: String, path: Option<String>) -> Result<String, String> {
+    let folder = folder_for(path)?;
+    let started = match target.as_str() {
+        "vscode" => {
+            let exe = vscode_exe().ok_or("VS Code is not installed")?;
+            // `code <folder>` is its documented form.
+            Command::new(exe)
+                .arg(&folder)
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn()
+                .map(|_| "VS Code")
+        }
+        "opencode-app" => {
+            let exe = opencode_desktop().ok_or("the OpenCode app is not installed")?;
+            // An Electron app that takes a path opens in it; the working directory
+            // is set as well so a build that ignores argv still starts in the
+            // right place rather than in `%WINDIR%\System32`.
+            Command::new(exe)
+                .arg(&folder)
+                .current_dir(&folder)
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn()
+                .map(|_| "OpenCode")
+        }
+        "opencode-cli" => {
+            let cli = opencode::cli().ok_or("the opencode CLI is not installed")?;
+            let wt = windows_terminal().ok_or("Windows Terminal is not installed")?;
+            // `-d` is the folder, and the CLI is the command the terminal runs —
+            // two separate arguments to `wt`, and the folder is never pasted into
+            // a command string.
+            Command::new(wt)
+                .arg("-d")
+                .arg(&folder)
+                .arg(cli)
+                .spawn()
+                .map(|_| "OpenCode (terminal)")
+        }
+        other => return Err(format!("{other} isn't somewhere this can open")),
+    };
+    let what = started.map_err(|e| format!("could not start it: {e}"))?;
+    log::line(format!("open in {what}: {}", folder.display()));
+    Ok(what.into())
+}
+
 /// "Open terminal" opens the working folder in VS Code when `code` is on PATH,
 /// and falls back to Explorer otherwise.
 #[tauri::command]
@@ -395,8 +557,32 @@ fn set_paused(paused: bool) {
 
 /// "Test connection" in settings → OpenCode version, or a readable error.
 #[tauri::command]
-async fn opencode_test(app: AppHandle) -> Result<String, String> {
-    opencode::test(app).await
+async fn opencode_test() -> Result<String, String> {
+    opencode::test().await
+}
+
+/// One health check against the configured address, with the reason it failed.
+///
+/// Separate from `opencode_test` because this one answers even when the server is
+/// down — it is the island's status line and its Retry, not a pass/fail button.
+#[tauri::command]
+async fn opencode_health() -> opencode::Health {
+    opencode::health().await
+}
+
+/// Starts an OpenCode on the configured port, if nothing is answering there.
+///
+/// Never a second one: a server already at that address is left alone, and only a
+/// server this call started is stopped when Piko exits.
+#[tauri::command]
+async fn opencode_start() -> Result<String, String> {
+    opencode::start_server().await
+}
+
+/// Keeps (or stops) the background reconnect loop. One loop runs at a time.
+#[tauri::command]
+fn opencode_watch(app: AppHandle, on: bool) {
+    opencode::watch(app, on);
 }
 
 /// "Auto-detect" in settings → first healthy default URL, if any.
@@ -649,6 +835,21 @@ fn create_settings_window(app: &AppHandle) {
     }
 }
 
+/// Hides the settings window, exactly as its close button does.
+///
+/// The close handler above cannot be reused from a command — it is a
+/// `CloseRequested` interceptor — and Escape has to end up in the same place, or
+/// the island is told the settings are still open and stays out of the way of a
+/// window nobody can see.
+#[tauri::command]
+fn close_settings_window(app: AppHandle) {
+    let Some(win) = app.get_webview_window("settings") else {
+        return;
+    };
+    let _ = win.hide();
+    let _ = app.emit_to(island::WINDOW_LABEL, "settings-open", false);
+}
+
 pub fn show_settings_window(app: &AppHandle) {
     let Some(win) = app.get_webview_window("settings") else {
         log::line("settings window missing");
@@ -761,7 +962,6 @@ pub fn run() {
         })
         .manage(Pending::default())
         .manage(Chat::default())
-        .manage(std::sync::Arc::new(opencode::Managed::new()))
         .manage(tasks::Registry::default())
         .invoke_handler(tauri::generate_handler![
             boot,
@@ -779,8 +979,13 @@ pub fn run() {
             island_geometry,
             open_url,
             open_in_vscode,
+            open_targets,
+            open_in,
             quit_app,
             opencode_test,
+            opencode_health,
+            opencode_start,
+            opencode_watch,
             opencode_detect,
             approval_decision,
             approval_decline,
@@ -796,6 +1001,7 @@ pub fn run() {
             refresh_integration,
             open_n8n,
             open_settings_window,
+            close_settings_window,
             set_paused,
             task_start,
             task_list,
@@ -844,7 +1050,7 @@ pub fn run() {
                 "--- Piko {} started ---",
                 env!("CARGO_PKG_VERSION")
             ));
-            opencode::start_managed(handle.clone());
+            opencode::forget_managed_connection(loaded.managed_server == Some(true));
             opencode::start(handle.clone());
             integrations::start(handle.clone());
             // The kill chord first: it is the one thing that must be live before
@@ -877,12 +1083,62 @@ pub fn run() {
         })
         .build(tauri::generate_context!())
         .expect("error while building Piko")
-        .run(|app, event| {
-            // The OpenCode server this process started is a child of this process:
-            // leaving it behind would mean the next launch finds a port held by a
-            // server nobody is looking after.
-            if let tauri::RunEvent::Exit = event {
-                opencode::shutdown_managed(app);
-            }
+.run(|_app, _event| {
+            // Nothing to tear down, except the one server this process may have
+            // been asked to start: a user-started OpenCode is deliberately left
+            // running, because it belongs to whoever started it.
+            opencode::shutdown_owned();
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_folder_that_is_not_there_is_refused_rather_than_opened() {
+        // The whole point of the guard: a path that does not exist is not something
+        // to hand to a process, and the error has to say which path failed.
+        let missing = folder_for(Some("C:\\piko-does-not-exist-9d2f".to_string()));
+        assert!(missing.is_err());
+        assert!(missing.unwrap_err().contains("is not a folder"));
+    }
+
+    #[test]
+    fn an_empty_path_is_not_a_folder() {
+        // What the island sends when the person has not chosen one.
+        assert!(folder_for(Some(String::new())).is_err());
+        assert!(folder_for(Some("   ".to_string())).is_err());
+    }
+
+    #[test]
+    fn a_real_folder_is_taken_as_asked() {
+        // `%TEMP%` exists on every machine this runs on, which is all it takes to
+        // prove the happy path is not the same branch as the refusal above.
+        let temp = std::env::temp_dir();
+        let picked = folder_for(Some(temp.to_string_lossy().to_string()));
+        assert_eq!(picked.unwrap(), temp);
+    }
+
+    #[test]
+    fn a_target_that_is_not_on_the_list_opens_nothing() {
+        // The id is matched, never assembled into a command: an unknown one is a
+        // refusal, so nothing here can become a path or an argument.
+        assert!(open_in("notepad".to_string(), None).is_err());
+        assert!(open_in("".to_string(), None).is_err());
+        assert!(open_in("../../evil".to_string(), None).is_err());
+    }
+
+    #[test]
+    fn the_offered_targets_are_the_ones_that_can_actually_be_started() {
+        // No assertion about which ones exist — that is the machine's business —
+        // only that every id offered is one `open_in` knows how to launch.
+        for t in open_targets() {
+            assert!(
+                matches!(t.id.as_str(), "vscode" | "opencode-app" | "opencode-cli"),
+                "{} is offered but cannot be opened",
+                t.id
+            );
+        }
+    }
 }

@@ -1,163 +1,53 @@
-// The one place Piko's app icon comes from.
+// The one place Piko's icon comes from.
 //
 //   npm run icons
 //
-// There is no "drawn in code" logo any more and no second script that can
-// disagree with this one. Everything downstream — the tray, the window, the
-// exe, the desktop shortcut, the NSIS installer and the Store tile — is derived
-// from the two masters rendered here, and `tauri icon` fills in the sizes we do
-// not hand-pick.
+// `assets/brand/` is the brand and it is an *input*: `piko-icon.svg` (the mark on its
+// tile) is what `tauri icon` gets, and `piko-mark.svg` (the bare mark) is what the
+// hand-assembled ICO and the tray asset are cut from. Nothing in this script draws,
+// redraws or regenerates the artwork — a build step that regenerates its own source
+// is a second source of truth that can disagree with the first.
 //
-// Order matters:
+//   assets/brand/piko-icon.svg  ──> tauri icon ──> PNGs, icns, Square*, StoreLogo
+//   assets/brand/piko-mark.svg  ──> icon.ico, 16/24/32/48/64/128/256
+//                             └─> piko-tray.png, 32, alpha only
 //
-//   robot.svg ──> master-b.png      (full detail, 1024, tiled)
-//             └─> master-b-small.png (simplified, 1024, tiled)
-//                        │
-//                        ├─> npx tauri icon  ──> every PNG/icns/Square*/StoreLogo
-//                        │
-//                        └─> icon.ico, hand-assembled, mixed frames
+// Two reasons this is not just `tauri icon`:
 //
-// The ICO is assembled by hand because `tauri icon` gives every frame the same
-// artwork, and one artwork cannot be right at both 16px and 256px. The mouth is
-// the first casualty at 16px and its absence there reads as a neutral face
-// rather than a mistake; the antenna is the opposite, it dissolves into the
-// background unless the stroke is thicker than the drawing has any reason to
-// draw it. So 16/24/32 come from the simplified master and 48+ from the full one.
+//   * `tauri icon` writes six ICO frames and skips 128. Explorer's medium-size slot
+//     and most "large icon" views ask for exactly that one, and an ICO without it
+//     falls back to the 64 — so the ICO is assembled here, and `tauri icon`'s is
+//     overwritten immediately after.
+//
+//   * The tray wants the bare mark, not the tile: a 16px notification-area slot with
+//     a rounded dark square inside it is a smudge. `piko-tray.png` keeps only the
+//     alpha — Windows draws a tray icon through that channel, so one white asset
+//     follows the taskbar's own light or dark theme instead of needing two files
+//     and a theme check.
+//
+// sharp rasterises the vector sources; it is a devDependency already used by the
+// inspection tools in dev/icon, and nothing here runs at app start-up.
 
 import sharp from "sharp";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { deflateSync } from "node:zlib";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-const SRC = process.env.PIKO_ROBOT_SVG ?? "C:/Users/User/Desktop/character piko/robot.svg";
-const WORK = join(ROOT, "dev", "icon");
+const BRAND = join(ROOT, "assets", "brand");
 const OUT = join(ROOT, "src-tauri", "icons");
 
-const MASTER = 1024;
-const MARGIN = 0.1; // 10% free space per side
-const INNER = Math.round(MASTER * (1 - MARGIN * 2));
-const TILE_PAD = Math.round(MASTER * 0.06); // room for the robot inside the tile
-const TILE_RADIUS = 0.22; // fraction of the tile side
+const ICON_SOURCE = join(BRAND, "piko-icon.svg");
+const MARK_SOURCE = join(BRAND, "piko-mark.svg");
 
-// Palette taken from robot.svg, so the tile belongs to the same drawing.
-const VISOR = "#1f2a33";
-const RULE = "#6fcfba";
+// Every size Explorer, the taskbar, the shell and NSIS can ask for.
+const ICO_FRAMES = [16, 24, 32, 48, 64, 128, 256];
 
-// ICO frames, and which master each one is drawn from.
-const ICO_FRAMES = [
-  { size: 16, from: "small" },
-  { size: 24, from: "small" },
-  { size: 32, from: "small" },
-  { size: 48, from: "full" },
-  { size: 64, from: "full" },
-  { size: 256, from: "full" },
-];
-
-// tauri icon writes the full-detail artwork at every PNG size. The two small
-// ones are re-cut from the simplified master so the PNG grid and the ICO agree:
-// bundle.icon hands 32x32.png to NSIS, and a shortcut that shows the full-detail
-// 32 while the exe shows the simplified 32 is the kind of mismatch nobody
-// notices until they do.
-const SMALL_PNGS = new Set(["32x32.png", "64x64.png"]);
-
-// ── source ────────────────────────────────────────────────────────────────────
-
-function readSvg() {
-  const raw = readFileSync(SRC, "utf8");
-  // The file carries a ~7.8KB c2pa manifest. It says nothing about how to draw
-  // the robot, it only survives in the original, and sharp would happily ignore
-  // it — but it makes diffing the geometry unreadable.
-  return raw.replace(/<metadata>[\s\S]*?<\/metadata>/, "");
-}
-
-/** Must actually replace, or the small master silently becomes a copy of the full one. */
-function sub(svg, from, to, why) {
-  if (!svg.includes(from)) {
-    throw new Error(`robot.svg changed shape: cannot ${why}\n  looking for: ${from}`);
-  }
-  return svg.replace(from, to);
-}
-
-/**
- * Simplified artwork for the small frames only. Deliberately just two edits, so
- * the small icon stays recognisably the same robot at 48px when the two sit next
- * to each other in the ICO.
- */
-function smallSvg(svg) {
-  let out = sub(
-    svg,
-    `<path d="M90 134 Q100 141 110 134" fill="none" stroke="#7ff3ff" stroke-width="5" stroke-linecap="round"/>`,
-    "",
-    "drop the mouth",
-  );
-  // 6 -> 10 on the stalk, and a fatter ball to match: at 16px the original
-  // leaves barely one device pixel of stalk and the head floats away from it.
-  out = sub(
-    out,
-    `<path d="M100 52 L100 30" fill="none" stroke="#231f20" stroke-width="6"`,
-    `<path d="M100 52 L100 30" fill="none" stroke="#231f20" stroke-width="10"`,
-    "thicken the antenna stalk",
-  );
-  return sub(
-    out,
-    `<circle cx="100" cy="24" r="10" fill="#ff7a8a" stroke="#231f20" stroke-width="6"`,
-    `<circle cx="100" cy="24" r="11" fill="#ff7a8a" stroke="#231f20" stroke-width="10"`,
-    "thicken the antenna head",
-  );
-}
-
-// ── render ────────────────────────────────────────────────────────────────────
-
-/**
- * rasterise, trim to the painted pixels, then contain inside the free area.
- *
- * The trim is what makes the 10% margin real. robot.svg's viewBox is a square
- * 200x200 but the artwork inside it is neither square nor centred — the antenna
- * adds height at the top and the body sits low — so containing the raw viewBox
- * silently leaves a much larger margin than asked for.
- */
-async function renderArtwork(svg) {
-  // density 600 gives librsvg ~1600px of working room before any downscaling, so
-  // the 6px strokes are several device pixels wide when they are rasterised.
-  const painted = await sharp(Buffer.from(svg), { density: 600 })
-    .trim({ threshold: 1 })
-    .png()
-    .toBuffer();
-  const m = await sharp(painted).metadata();
-  console.log(`  artwork ${m.width}x${m.height} (ratio ${(m.width / m.height).toFixed(3)})`);
-  return sharp(painted)
-    .resize(INNER, INNER, { fit: "contain", background: { r: 0, g: 0, b: 0, alpha: 0 }, kernel: "lanczos3" })
-    .png()
-    .toBuffer();
-}
-
-/**
- * The robot inset in a rounded square. The tile is the full 1024 with no margin:
- * the tile is the margin. A transparent ring on top of a solid tile would only
- * shrink the robot inside an already-small box, since taskbar and Explorer slots
- * crop to the tile edges.
- */
-async function renderMaster(artwork) {
-  const side = MASTER - TILE_PAD * 2;
-  const r = Math.round(side * TILE_RADIUS);
-  const rule = Math.round(MASTER * 0.008);
-  const robot = await sharp(artwork)
-    .resize(side, side, { fit: "contain", background: { r: 0, g: 0, b: 0, alpha: 0 } })
-    .png()
-    .toBuffer();
-  const tile = Buffer.from(
-    `<svg width="${MASTER}" height="${MASTER}">
-       <rect width="${MASTER}" height="${MASTER}" rx="${r}" ry="${r}" fill="${VISOR}"/>
-       <rect x="${TILE_PAD}" y="${TILE_PAD}" width="${side}" height="${side}"
-             rx="${Math.round(r * 0.82)}" ry="${Math.round(r * 0.82)}"
-             fill="none" stroke="${RULE}" stroke-opacity="0.28" stroke-width="${rule}"/>
-     </svg>`,
-  );
-  return sharp(tile).composite([{ input: robot, gravity: "center" }]).png().toBuffer();
-}
+// The notification-area slot is 16–24px; 32 is what Windows scales that up from and
+// what a 200% display actually asks for.
+const TRAY_SIZE = 32;
 
 // ── PNG ───────────────────────────────────────────────────────────────────────
 
@@ -207,9 +97,7 @@ function encodePNG(size, rgba) {
 
 // ── ICO ───────────────────────────────────────────────────────────────────────
 
-// PNG-in-ICO, which Windows has read since Vista. Small frames are still
-// bit-transparent here, so a simplified 16px frame is not worse off than a
-// full-detail one — it is only fewer things to fit.
+// PNG-in-ICO, which Windows has read since Vista.
 function encodeICO(entries) {
   const header = Buffer.alloc(6);
   header.writeUInt16LE(0, 0);
@@ -232,67 +120,67 @@ function encodeICO(entries) {
   return Buffer.concat([header, dir, ...entries.map((e) => e.png)]);
 }
 
-async function downscale(master, size) {
-  const rgba = await sharp(master)
-    .ensureAlpha()
-    .resize(size, size, { fit: "fill", kernel: "lanczos3" })
-    .raw()
-    .toBuffer();
-  return encodePNG(size, rgba);
-}
-
 // ── go ────────────────────────────────────────────────────────────────────────
 
-mkdirSync(WORK, { recursive: true });
 mkdirSync(OUT, { recursive: true });
 
-const svg = readSvg();
-const fullArt = await renderArtwork(svg);
-const smallArt = await renderArtwork(smallSvg(svg));
-const masterFull = await renderMaster(fullArt);
-const masterSmall = await renderMaster(smallArt);
+// 1. Everything Windows and the app itself asks for, from the tiled icon. The CLI is
+//    a node script, so it is run by the node that is running this file: `npx` is a
+//    `.cmd`, and spawning one needs a shell.
+execFileSync(
+  process.execPath,
+  [join(ROOT, "node_modules", "@tauri-apps", "cli", "tauri.js"), "icon", ICON_SOURCE],
+  { cwd: ROOT, stdio: "inherit" },
+);
 
-const masters = { full: masterFull, small: masterSmall };
-writeFileSync(join(WORK, "robot.svg"), readSvg());
-writeFileSync(join(WORK, "robot-small.svg"), smallSvg(svg));
-writeFileSync(join(WORK, "master-b.png"), masterFull);
-writeFileSync(join(WORK, "master-b-small.png"), masterSmall);
-console.log(`dev/icon: robot.svg, robot-small.svg, master-b.png, master-b-small.png`);
-
-// The full-detail master is what everything standard-sized should look like.
-// Spawn the local CLI's entry through node rather than going through npx: npx is
-// npx.cmd on Windows, which spawnSync will not resolve, and going straight to the
-// installed package also means a missing devDependency fails here instead of
-// quietly downloading a different CLI version.
-const tauriCli = join(ROOT, "node_modules", "@tauri-apps", "cli", "tauri.js");
-execFileSync(process.execPath, [tauriCli, "icon", join(WORK, "master-b.png")], {
-  cwd: ROOT,
-  stdio: "inherit",
-});
-
-for (const name of SMALL_PNGS) {
-  const path = join(OUT, name);
-  const size = Number(/^(\d+)x/.exec(name)[1]);
-  writeFileSync(path, await downscale(masterSmall, size));
-  console.log(`  re-cut ${name} from the simplified master`);
-}
-
+// 2. The ICO, with a 128 frame that the generator above leaves out. Cut from the
+//    *tiled* icon, like every PNG beside it: a shortcut and a taskbar button want
+//    the tile, and only the notification area wants the bare mark (step 3).
 const frames = [];
-for (const { size, from } of ICO_FRAMES) {
-  frames.push({ size, png: await downscale(masters[from], size) });
+for (const size of ICO_FRAMES) {
+  const rgba = await sharp(ICON_SOURCE, { density: 600 })
+    .resize(size, size, { fit: "contain", background: { r: 0, g: 0, b: 0, alpha: 0 } })
+    .ensureAlpha()
+    .raw()
+    .toBuffer();
+  frames.push({ size, png: encodePNG(size, rgba) });
 }
 const ico = encodeICO(frames);
 writeFileSync(join(OUT, "icon.ico"), ico);
-console.log(
-  `icon.ico — ${ico.length} bytes — ${ICO_FRAMES.map((f) => `${f.size}(${f.from})`).join(" ")}`,
-);
+console.log(`icon.ico — ${ico.length} bytes — ${ICO_FRAMES.join("/")}`);
 
-// The tray has no icon file of its own: tray.rs hands the builder
-// `app.default_window_icon()`, which Tauri fills from bundle.icon, and bundle.icon
-// points at icons/icon.ico. Copying anything here would create a second icon that
-// could drift. Say so instead of quietly doing nothing.
-if (process.argv.includes("--tray")) {
-  console.log("tray: no separate file — it reads default_window_icon() from bundle.icon");
+// 3. The tray asset: the mark's coverage and nothing else. Windows renders a tray
+//    icon through the alpha channel, so the RGB underneath is never seen — which is
+//    what lets one file work on a light taskbar and a dark one.
+{
+  const { data, info } = await sharp(MARK_SOURCE, { density: 600 })
+    .resize(TRAY_SIZE, TRAY_SIZE, { fit: "contain", background: { r: 0, g: 0, b: 0, alpha: 0 } })
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  const mask = Buffer.alloc(info.width * info.height * 4);
+  for (let i = 0; i < info.width * info.height; i++) {
+    mask[i * 4] = 255;
+    mask[i * 4 + 1] = 255;
+    mask[i * 4 + 2] = 255;
+    mask[i * 4 + 3] = data[i * 4 + 3];
+  }
+  writeFileSync(join(OUT, "piko-tray.png"), encodePNG(info.width, mask));
+  console.log(`piko-tray.png — ${TRAY_SIZE}x${TRAY_SIZE}, alpha only`);
 }
+
+// 4. The bare mark and its black twin, exported as PNGs for anything that cannot take
+//    a vector (docs, the settings window, a README). Written beside the sources so
+//    the brand folder stays the thing a person edits.
+mkdirSync(join(BRAND, "png"), { recursive: true });
+for (const size of [16, 24, 32, 48, 64, 128, 256, 512]) {
+  for (const [name, source] of [["piko-mark", MARK_SOURCE], ["piko-mark-dark", join(BRAND, "piko-mark-dark.svg")]]) {
+    await sharp(source, { density: 600 })
+      .resize(size, size, { fit: "contain", background: { r: 0, g: 0, b: 0, alpha: 0 } })
+      .png()
+      .toFile(join(BRAND, "png", `${name}-${size}.png`));
+  }
+}
+console.log("assets/brand/png — mark and dark twin at 16…512");
 
 console.log("done");

@@ -1,0 +1,24 @@
+<!--
+  Piko brand mark, black — the same geometry as piko-mark.svg for light grounds.
+  Only the fill changes: a mask is white-keeps / black-cuts whichever colour the
+  shape itself is, so the two files are the mark and nothing else.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <mask id="piko-mark-dark-cut" maskUnits="userSpaceOnUse" x="0" y="0" width="512" height="512">
+      <rect width="512" height="512" fill="#FFFFFF"/>
+      <rect x="208" y="56" width="96" height="80" rx="20" fill="#000000"/>
+      <circle cx="196" cy="272" r="34" fill="#000000"/>
+      <circle cx="316" cy="272" r="34" fill="#000000"/>
+    </mask>
+  </defs>
+
+  <path fill="#000000" mask="url(#piko-mark-dark-cut)" d="
+    M432,256
+    C432,383 383,432 256,432
+    C129,432 80,383 80,256
+    C80,129 129,80 256,80
+    C383,80 432,129 432,256
+    Z
+  "/>
+</svg>

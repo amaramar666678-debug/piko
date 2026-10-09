@@ -1,5 +1,6 @@
 // Notification-area icon: Open, Settings, Pause, Quit.
 
+use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter};
@@ -8,6 +9,15 @@ use crate::island::WINDOW_LABEL;
 
 /// Tray id, fixed so `set_badge` can find the icon again later.
 pub const TRAY_ID: &str = "piko";
+
+/// The bare brand mark, alpha only — not the app-icon tile.
+///
+/// A notification-area slot is 16–24px, and a rounded dark square inside it is a
+/// smudge; the mark alone is what stays legible there. The RGB underneath is white
+/// and never seen, because Windows draws a tray icon through its alpha channel —
+/// which is also why this one file is right on a light taskbar and a dark one, with
+/// no theme check and no second asset.
+static TRAY_PNG: &[u8] = include_bytes!("../icons/piko-tray.png");
 
 pub fn build(app: &AppHandle) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "Open Piko", true, None::<&str>)?;
@@ -30,8 +40,17 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
             }
         });
 
-    if let Some(icon) = app.default_window_icon().cloned() {
-        builder = builder.icon(icon);
+    // Decoded rather than shipped as a Rust byte array: `png` is already a direct
+    // dependency — the MCP screenshot tool encodes with it — so this adds nothing
+    // to the build, and the asset stays a PNG a person can open and look at.
+    if let Ok(mut reader) = png::Decoder::new(TRAY_PNG).read_info() {
+        let mut buf = vec![0u8; reader.output_buffer_size()];
+        if let Ok(info) = reader.next_frame(&mut buf) {
+            if info.bit_depth == png::BitDepth::Eight && info.color_type == png::ColorType::Rgba
+            {
+                builder = builder.icon(Image::new(&buf, info.width, info.height));
+            }
+        }
     }
 
     builder.build(app)?;

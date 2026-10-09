@@ -1,9 +1,8 @@
 // App state — mirror of AppState.swift (the parts the island needs).
 
-import type { BotEmoteName, BotStateName, Dock, IslandMode, IslandViewName } from "./layout";
+import type { BotStateName, Dock, IslandMode, IslandViewName } from "./layout";
 import { Bridge, type AgentInfo, type McpAsk, type McpStatus, type TaskInfo } from "./bridge";
 import type { CharacterId } from "../characters";
-import type { EyeShape } from "../piko/engine";
 
 /**
  * How many agent pills fit in the overview row.
@@ -44,6 +43,28 @@ export function taskKindInstruction(kind: TaskKind): string {
 }
 export type PillBadge = "approval" | "finished" | "error";
 
+/**
+ * What the island knows about the OpenCode connection.
+ *
+ * `unknown` is deliberate and is not `failed`: the app has not asked yet, and a
+ * status line that starts red would be reporting a problem nobody has hit.
+ */
+export type ConnectionState =
+  | { kind: "unknown" }
+  /** A check is in flight, or `opencode serve` is being started. */
+  | { kind: "connecting"; what: string }
+  | { kind: "connected"; version: string; url: string }
+  | {
+      kind: "failed";
+      url: string;
+      reason: string;
+      /** No `opencode` anywhere — retrying cannot help. */
+      cliMissing: boolean;
+    };
+
+/** The three places the island knows how to open a folder in. */
+export type OpenInTarget = "vscode" | "opencode-app" | "opencode-cli";
+
 export interface AgentTask {
   id: string;
   name: string;
@@ -53,8 +74,6 @@ export interface AgentTask {
   steps: string[];
   source: AgentSource;
   isIntegration: boolean;
-  emote?: BotEmoteName | null;
-  miniEye?: EyeShape | null;
   pillBadge?: PillBadge | null;
   sessionCwd?: string | null;
 }
@@ -76,9 +95,9 @@ export interface ChatMessage {
   content: string;
 }
 
-export type PromptContext =
-  | { kind: "window"; appName: string; title: string; url?: string }
-  | { kind: "file"; name: string; path?: string };
+// Was `PromptContext`, with a `promptContext` field beside it: the room builds
+// the file context from `droppedFile` when the first message goes out, so it was
+// written in three places and read by nothing.
 
 export interface ResultItem {
   label: string;
@@ -186,13 +205,17 @@ export interface Settings {
    * should not silently change the other.
    */
   chatAgent: string;
-  /** Piko starts and owns its own OpenCode server. On by default. */
-  managedServer: boolean;
-    /** Selected character */
-    characterId: CharacterId;
-    /** Which screen edge the collapsed bubble docks to. */
-    dock: Dock;
-  }
+  /**
+   * What the island's "Open in…" button opens. Empty means "whichever of the
+   * available targets comes first", which is the only safe default: the list
+   * depends on what is installed, and this file cannot know that.
+   */
+  openInDefault: OpenInTarget | "";
+  /** Selected character */
+  characterId: CharacterId;
+  /** Which screen edge the collapsed bubble docks to. */
+  dock: Dock;
+}
 
 export const DEFAULT_SETTINGS: Settings = {
   soundEnabled: true,
@@ -210,7 +233,7 @@ export const DEFAULT_SETTINGS: Settings = {
     miniGrid: false,
   taskAgent: "",
   chatAgent: "",
-  managedServer: true,
+  openInDefault: "",
   characterId: "heart",
   dock: "top",
 };
@@ -238,7 +261,6 @@ class AppState {
   uploadDuration = 2.4;
   fileDragOver = false;
 
-  promptContext: PromptContext | null = null;
   droppedFile: { name: string; path: string } | null = null;
   noteMessage: string | null = null;
   searchResult: SearchResult | null = null;
@@ -296,6 +318,20 @@ class AppState {
   taskAgentsError: string | null = null;
   /** True once a fetch has come back, so the room can tell loading from empty. */
   taskAgentsLoaded = false;
+
+  /**
+   * What is known about the connection to OpenCode.
+   *
+   * Kept apart from `taskAgentsError` because they are different questions: that
+   * one is "can I list agents", this is "is there a server there at all". A Retry
+   * that only re-listed agents was the reported bug — it re-asked a question the
+   * failure was not about, and did nothing about the answer.
+   *
+   * `unknown` is the honest starting point: nothing has been asked yet, which is
+   * not the same as failed and must not be drawn as though it were.
+   */
+  connection: ConnectionState = { kind: "unknown" };
+
   /** "ask" is the normal chat; "task" starts a real session in a folder. */
   chatMode: "ask" | "task" = "ask";
   /**
@@ -501,7 +537,13 @@ class AppState {
     // Keep the declared order so pills never shuffle.
     const order = INTEGRATION_AGENTS.map((t) => t.id);
     this.tasks.sort((a, b) => order.indexOf(a.id) - order.indexOf(b.id));
-    if (!this.focusId) this.focusId = "integration_claude";
+    // Focus starts on something a person can actually act on. `integration_claude`
+    // is still loaded — it carries activity in sessions Piko did not start — but it
+    // is no longer a row in the overview, so opening the panel on it would show a
+    // card about a thing with no button on it.
+    if (!this.focusId || !this.tasks.some((t) => t.id === this.focusId && t.id !== "integration_claude")) {
+      this.focusId = this.tasks.find((t) => t.id !== "integration_claude")?.id ?? "integration_claude";
+    }
     this.notify();
   }
 

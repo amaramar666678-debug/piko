@@ -104,12 +104,11 @@ export const BOT_STATES: Record<BotStateName, BotStateCfg> = {
   dizzy: { ...base, color: C.dizzy, tint: 0.7, eye: "spiral", badge: null },
 };
 
-/** State → sound, as in BotStateCfg.sound. */
-export const STATE_SOUND: Partial<Record<BotStateName, string>> = {
-  working: "work", thinking: "think", searching: "search", approval: "approval",
-  question: "question", error: "error", finished: "finish", ratelimit: "rate",
-  sleeping: "sleep", dizzy: "dizzy",
-};
+// There is no `STATE_SOUND` table here any more. The island plays a sound per
+// hook event, from the event rather than from the resulting state: `working` can
+// be reached by three different events and only one of them should make a noise,
+// and a state that arrives from the OpenCode stream rather than from a hook has no
+// event to hang one on.
 
 const EMOTE_EYE: Record<BotEmoteName, EyeShape> = {
   love: "heart", surprised: "dot", proud: "star", wink: "wink",
@@ -222,8 +221,6 @@ export class BotEngine {
   eyeOverride: EyeShape | null = null;
   eyeOverrideUntil = 0;
   permanentEye: EyeShape | null = null;
-  permanentEmote: BotEmoteName | null = null;
-  miniNextBehavior = 0;
 
   badge: Badge | null = null;
   private badgeKey = "none";
@@ -388,23 +385,6 @@ export class BotEngine {
     this.waveUntil = 0;
     this.waveStart = 0;
     this.anim("hands", [[0, 150, Ease.inOut]]);
-  }
-
-  setPermanentEmote(emote: BotEmoteName | null) {
-    this.permanentEmote = emote;
-    if (emote === "wink") {
-      this.miniNextBehavior = now() + 0.8 + Math.random() * 1.7;
-      return;
-    }
-    this.permanentEye = emote ? EMOTE_EYE[emote] : null;
-    if (this.permanentEye) {
-      this.eyeOverride = this.permanentEye;
-      this.eyeOverrideUntil = Number.POSITIVE_INFINITY;
-    } else if (this.eyeOverrideUntil === Number.POSITIVE_INFINITY) {
-      this.eyeOverride = null;
-      this.eyeOverrideUntil = 0;
-    }
-    this.miniNextBehavior = now() + 0.8 + Math.random() * 1.7;
   }
 
   triggerEmote(emote: BotEmoteName, duration = 1.8) {
@@ -586,8 +566,6 @@ export class BotEngine {
       this.tgSx = 1;
     }
 
-    if (this.isMini && n > this.miniNextBehavior) this.doMiniBehaviorLoop();
-
     const kLook = 1 - Math.pow(0.0025, dt);
     if (!this.locks.has("yaw")) this.yaw += (this.tgYaw - this.yaw) * kLook;
     if (!this.locks.has("pitch")) this.pitch += (this.tgPitch - this.pitch) * kLook;
@@ -628,40 +606,6 @@ export class BotEngine {
     this.slotH = Math.max(0, this.slotH + this.slotHVel * dt);
 
     this.lastTime = n;
-  }
-
-  private doMiniBehaviorLoop() {
-    const n = now();
-    switch (this.permanentEmote) {
-      case "happy":
-        if (this.locks.has("oy")) { this.miniNextBehavior = n + 0.4; return; }
-        this.anim("oy", [[-0.3, 120, Ease.out], [0.03, 200, Ease.inOut], [0, 160, Ease.back]]);
-        this.anim("sy", [[0.82, 80, Ease.out], [1.18, 130, Ease.out], [0.88, 160, Ease.inOut], [1, 200, Ease.back]]);
-        this.anim("sx", [[1.15, 80, Ease.out], [0.88, 130, Ease.out], [1.06, 160, Ease.inOut], [1, 200, Ease.back]]);
-        this.miniNextBehavior = n + 2.2 + Math.random() * 1.2;
-        break;
-      case "annoyed":
-        if (this.locks.has("yaw")) { this.miniNextBehavior = n + 0.5; return; }
-        this.anim("yaw", [
-          [-0.65, 50, Ease.out], [0.65, 90, Ease.inOut], [-0.5, 80, Ease.inOut],
-          [0.4, 75, Ease.inOut], [-0.2, 70, Ease.inOut], [0, 140, Ease.out],
-        ]);
-        this.miniNextBehavior = n + 3.0 + Math.random() * 2.5;
-        break;
-      case "wink":
-        this.eyeOverride = "wink";
-        this.eyeOverrideUntil = n + 0.55;
-        this.anim("tilt", [[0.13, 100, Ease.out], [0.13, 320, Ease.lin], [0, 200, Ease.inOut]]);
-        this.miniNextBehavior = n + 2.2 + Math.random() * 2.0;
-        break;
-      case "love":
-        this.emit("heart", 2);
-        this.anim("tilt", [[-0.1, 180, Ease.out], [0.1, 340, Ease.inOut], [0, 220, Ease.inOut]]);
-        this.miniNextBehavior = n + 2.6 + Math.random() * 1.5;
-        break;
-      default:
-        this.miniNextBehavior = n + 3.0 + Math.random() * 2.0;
-    }
   }
 
   // ── Draw ────────────────────────────────────────────────────────────────────

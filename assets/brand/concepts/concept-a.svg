@@ -1,0 +1,30 @@
+<!--
+  Piko — concept A: "Two windows"
+  A soft square head with two tall slot eyes instead of dots: a visor rather than a face.
+  Slot-shaped eyes survive a 16px downscale where round dots turn to mud, and the low,
+  wide set is what keeps it off the generic-chatbot silhouette.
+
+  The eyes are cut with a <mask>, not with `fill-rule="evenodd"` on one path: evenodd
+  XORs overlapping subpaths, so a cut that crosses the outline fills the part that
+  hangs outside it. A mask subtracts, everywhere, with no such surprise.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <mask id="a-cut" maskUnits="userSpaceOnUse" x="0" y="0" width="512" height="512">
+      <rect width="512" height="512" fill="#FFFFFF"/>
+      <rect x="176" y="200" width="52" height="112" rx="26" fill="#000000"/>
+      <rect x="284" y="200" width="52" height="112" rx="26" fill="#000000"/>
+    </mask>
+  </defs>
+
+  <!-- One flat shape. Superellipse (exponent ≈4): the curve leaves each axis point
+       perpendicular to it, which is what makes it read square rather than round. -->
+  <path fill="#FFFFFF" mask="url(#a-cut)" d="
+    M432,256
+    C432,383 383,432 256,432
+    C129,432 80,383 80,256
+    C80,129 129,80 256,80
+    C383,80 432,129 432,256
+    Z
+  "/>
+</svg>

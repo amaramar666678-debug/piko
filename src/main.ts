@@ -1,9 +1,10 @@
 // Entry point: boot the bridge, wire the island, start the greeting.
 
 import "./style.css";
-import { Bridge, IS_TAURI, onEvent } from "./core/bridge";
+import { Bridge, IS_TAURI, onEvent, type OpenCodeHealth } from "./core/bridge";
 import { Sound } from "./core/sound";
 import { State, type Settings } from "./core/state";
+import { applyEvent as applyConnection, watch as watchConnection } from "./core/connection";
 import { Island } from "./island/island";
 import { registerHookHandlers } from "./island/hooks";
 import { registerChatStream } from "./views/chat";
@@ -58,6 +59,11 @@ async function main() {
 
   await onEvent<null>("screen-changed", () => void Bridge.reposition());
 
+  // The reconnect loop's progress. Pushed rather than polled so the island can say
+  // what it is waiting for, and so the "connecting" line is the server's own news
+  // rather than this side's guess that it is still trying.
+  await onEvent<OpenCodeHealth>("opencode-status", (health) => applyConnection(health));
+
   // The settings window is always-on-top-beneath the island. Rust reports both
   // edges of it, so the panel is not sitting on the settings pane and is not left
   // collapsed once the settings window closes.
@@ -77,6 +83,12 @@ async function main() {
   registerHookHandlers(island);
   registerChatStream();
   registerIntegrationHandlers(island);
+
+  // A connection nobody has asked about yet is `unknown`, which is honest: the app
+  // has not checked. Asking here would put a "failed" state on screen for every
+  // launch on a machine where OpenCode is simply not running until someone opens
+  // the room that needs it.
+  void watchConnection(false);
 
   island.launch();
 

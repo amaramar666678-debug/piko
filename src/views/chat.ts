@@ -6,6 +6,7 @@ import { ICONS } from "./icons";
 import { Bridge, onEvent, type ChatContext, type AgentInfo } from "../core/bridge";
 import { Sound } from "../core/sound";
 import { State, type ChatMessage } from "../core/state";
+import * as Connection from "../core/connection";
 import type { IslandViewName } from "../core/layout";
 import type { ViewHost } from "./views";
 
@@ -237,11 +238,44 @@ export function buildPrompt(onHeightChange: () => void, goTo: (v: IslandViewName
   const agentNote = h("span", { class: "agent-note-text" });
   const agentRetry = h(
     "button",
-    { class: "agent-retry", title: "Ask OpenCode again", onclick: () => void loadAgents(true) },
+    {
+      class: "agent-retry",
+      title: "Check the connection to OpenCode",
+      onclick: () => void retryConnection(),
+    },
     svg(ICONS.refresh, 9),
     h("span", { text: "Retry" }),
   );
-  const agentProblem = h("div", { class: "agent-problem" }, agentNote, agentRetry);
+  /**
+   * Only offered when retrying cannot help — there is no `opencode` on the machine
+   * — and hidden the moment the program exists, so a transient failure never grows
+   * a button that would do nothing.
+   */
+  const agentStart = h(
+    "button",
+    {
+      class: "agent-retry agent-start",
+      title: "Start OpenCode on the configured port",
+      onclick: () => void Connection.start(),
+    },
+    h("span", { text: "Start OpenCode" }),
+  );
+  const agentProblem = h("div", { class: "agent-problem" }, agentNote, agentRetry, agentStart);
+
+  /**
+   * The Retry that actually retries.
+   *
+   * It used to re-list the agents, which re-asks a question the failure was not
+   * about: the server was not answering, so listing agents fails for the same
+   * reason and the button appeared to do nothing at all. This asks the question
+   * that was actually wrong — is anything there — and then re-asks for the agents
+   * whatever the answer was, because both were stale and the person who pressed it
+   * wants fresh content rather than a diagnosis.
+   */
+  async function retryConnection() {
+    await Connection.check();
+    await loadAgents(true);
+  }
 
   // The name of whoever is about to answer, next to the field that sends to them.
   // A chip rather than a dropdown because the answer to "who is replying to me" has
@@ -361,18 +395,57 @@ export function buildPrompt(onHeightChange: () => void, goTo: (v: IslandViewName
     // With nothing chosen there is nothing to say, so it goes rather than lying.
     agentChip.style.display = chosen ? "" : "none";
 
-    const failing = State.taskAgentsError !== null;
-    const empty = !failing && list.length === 0 && State.taskAgentsLoaded;
-    agentProblem.style.display = failing || empty ? "" : "none";
-    agentBar.style.display = failing || empty ? "none" : "";
-    if (failing) {
+    renderConnection();
+    agentRetry.title = `Check the connection to OpenCode${setting === "chatAgent" ? " (chat)" : " (task)"}`;
+  }
+
+  /**
+   * The connection row: what is known, and the two things that can be done about it.
+   *
+   * It reads `State.connection` rather than `taskAgentsError` because the two are
+   * different questions — "is there a server there" versus "can I list agents" —
+   * and only the first one is the thing Retry can fix.
+   */
+  function renderConnection() {
+    const conn = State.connection;
+    const failing = conn.kind === "failed";
+    const busy = conn.kind === "connecting";
+    const agentsFailing = State.taskAgentsError !== null;
+    const empty = !failing && !busy && !agentsFailing && noAgents();
+
+    const show = failing || busy || agentsFailing || empty;
+    agentProblem.style.display = show ? "" : "none";
+    agentBar.style.display = failing || busy || agentsFailing || empty ? "none" : "";
+    if (!show) return;
+
+    if (busy) {
+      agentNote.textContent = conn.what;
+    } else if (failing) {
+      // The address is in the message on purpose: the most common cause of all is
+      // that Piko is pointed at a port nothing is listening on, and the port is the
+      // one fact needed to recognise that.
+      agentNote.textContent = conn.cliMissing
+        ? conn.reason
+        : `${conn.reason} — nothing is answering at ${conn.url}.`;
+    } else if (agentsFailing) {
       agentNote.textContent = `No connection to OpenCode. ${State.taskAgentsError}`;
-    } else if (empty) {
+    } else {
       // Connected, answered, and offered nobody. A different problem from the one
       // above, so it says so rather than borrowing the connection's wording.
       agentNote.textContent = "OpenCode has no agents available.";
     }
-    agentRetry.title = `Ask OpenCode again${setting === "chatAgent" ? " (chat)" : " (task)"}`;
+
+    // The Start button earns its place only when there is a server to start.
+    const wantStart = failing && !conn.cliMissing;
+    agentStart.style.display = wantStart ? "" : "none";
+    // Retry is pointless while a check is already in flight — two checks race, and
+    // the slower one wins the state for no reason.
+    agentRetry.style.display = busy ? "none" : "";
+  }
+
+  /** Connected and answered with nobody on offer: a different problem entirely. */
+  function noAgents(): boolean {
+    return choosable(State.taskAgents).length === 0 && State.taskAgentsLoaded;
   }
 
   /**
@@ -496,9 +569,26 @@ export function buildPrompt(onHeightChange: () => void, goTo: (v: IslandViewName
       State.chatPending = false;
       State.stateOverride = null;
       State.chatHistory.pop();
-      State.noteMessage = String(err).replace(/^Error:\s*/, "");
-      State.view = "note";
-      Sound.play("error");
+      const why = String(err).replace(/^Error:\s*/, "");
+      // The server was not there. That is a fact about the connection and not about
+      // the question, so it is reported as one — in the room, where the retry and
+      // the Start button are — instead of throwing the person out to a note card
+      // whose only button goes back to a room that cannot send anything.
+      if (Connection.isConnectionFailure(why)) {
+        void Bridge.log(`chat send failed: ${why}`);
+        Sound.play("error");
+        State.connection = {
+          kind: "failed",
+          url: "unknown",
+          reason: why,
+          cliMissing: /not installed|no `opencode` on PATH/i.test(why),
+        };
+        Connection.watch(true);
+      } else {
+        State.noteMessage = why;
+        State.view = "note";
+        Sound.play("error");
+      }
     } finally {
       // Unlocked as soon as the request is in, not when the answer is: the input
       // belongs to the person, and `chatPending` is what the island watches now.
@@ -533,6 +623,11 @@ export function buildPrompt(onHeightChange: () => void, goTo: (v: IslandViewName
       if (!agentsRequested) {
         agentsRequested = true;
         void loadAgents();
+        // Ask once, and keep asking in the background while the room is open. The
+        // state starts `unknown`, and saying so is the whole point: an app that
+        // has not checked must not draw a connection it has not measured.
+        if (State.connection.kind === "unknown") void Connection.check();
+        Connection.watch(true);
       }
       if (mode !== renderedMode) {
         renderedMode = mode;
@@ -645,6 +740,10 @@ export function buildPrompt(onHeightChange: () => void, goTo: (v: IslandViewName
       // Come back with nothing to show? Ask again. A list that loaded once is kept,
       // so reopening the room is not a second round trip every time.
       if (State.taskAgentsError) agentsRequested = false;
+      // The reconnect loop exists for the room and for nothing else: a closed room
+      // cannot send a turn that failed, so nothing is gained by probing a server
+      // once a second for as long as Piko is open.
+      Connection.watch(false);
     },
     focus() {
       input.focus();

@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Piko — brand concepts</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #0E0F13;
+    color: #E6E8EC;
+    font: 14px/1.55 ui-sans-serif, "Segoe UI", system-ui, sans-serif;
+    padding: 40px 32px 72px;
+  }
+  h1 { font-size: 20px; font-weight: 600; letter-spacing: -0.01em; }
+  .lede { color: #8A9099; margin: 6px 0 32px; max-width: 68ch; }
+  .concept { margin: 0 0 44px; }
+  .head { display: flex; align-items: baseline; gap: 12px; margin: 0 0 14px; }
+  .head h2 { font-size: 15px; font-weight: 600; }
+  .head .note { color: #8A9099; font-size: 12.5px; }
+  .grid { display: grid; grid-template-columns: 268px 1fr; gap: 24px; align-items: start; }
+  .stage { display: flex; align-items: flex-end; gap: 20px; flex-wrap: wrap; }
+  .cell { display: flex; flex-direction: column; align-items: center; gap: 7px; }
+  .cell .size { color: #6E747D; font-size: 11px; font-variant-numeric: tabular-nums; }
+  .board { border-radius: 14px; padding: 22px; }
+  .board.dark { background: #14161A; }
+  .board.light { background: #F2F3F5; }
+  .board.light .size { color: #6B7076; }
+  /* The marks are drawn white on transparent. On the light board the whole
+     image is inverted, which is exactly the "black on light" case: one file,
+     one colour, no second asset to keep in step. */
+  .board.light img { filter: invert(1); }
+  img { display: block; image-rendering: auto; }
+  .pixelated img { image-rendering: pixelated; }
+  .why { color: #A8AEB6; font-size: 13px; max-width: 60ch; }
+  .why b { color: #E6E8EC; font-weight: 600; }
+  .legend { color: #6E747D; font-size: 12px; margin: 36px 0 0; max-width: 72ch; }
+  code { background: #191B20; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+</style>
+</head>
+<body>
+
+<h1>Piko — brand concepts</h1>
+<p class="lede">
+  Three marks, all one flat colour, all readable at 16&nbsp;px. Nothing here is applied:
+  the app icon, the tray icon and every UI asset are untouched. These are candidates only.
+</p>
+
+<!-- ── A ─────────────────────────────────────────────────────────────── -->
+<section class="concept">
+  <div class="head">
+    <h2>A — Two windows</h2>
+    <span class="note">soft square · slot eyes</span>
+  </div>
+  <div class="grid">
+    <div class="stage">
+      <div class="cell"><img src="concept-a.svg" width="256" height="256"><span class="size">256</span></div>
+      <div class="cell"><img src="concept-a-icon.svg" width="128" height="128"><span class="size">icon 128</span></div>
+    </div>
+    <div>
+      <div class="stage">
+        <div class="board dark">
+          <div class="stage">
+            <div class="cell"><img src="concept-a.svg" width="256" height="256"><span class="size">256</span></div>
+            <div class="cell"><img src="concept-a.svg" width="64" height="64"><span class="size">64</span></div>
+            <div class="cell pixelated"><img src="concept-a.svg" width="32" height="32"><span class="size">32</span></div>
+            <div class="cell pixelated"><img src="concept-a.svg" width="16" height="16"><span class="size">16</span></div>
+          </div>
+        </div>
+        <div class="board light">
+          <div class="stage">
+            <div class="cell"><img src="concept-a.svg" width="256" height="256"><span class="size">256</span></div>
+            <div class="cell"><img src="concept-a.svg" width="64" height="64"><span class="size">64</span></div>
+            <div class="cell pixelated"><img src="concept-a.svg" width="32" height="32"><span class="size">32</span></div>
+            <div class="cell pixelated"><img src="concept-a.svg" width="16" height="16"><span class="size">16</span></div>
+          </div>
+        </div>
+      </div>
+      <p class="why" style="margin-top:14px">
+        <b>The idea.</b> A soft square head whose eyes are two tall slots rather than dots — a visor,
+        not a face. <b>Why it holds up.</b> A slot keeps its edges when a 3&nbsp;px dot turns to mud,
+        and the low, wide set is what keeps the silhouette off the generic chat-bubble.
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ── B ─────────────────────────────────────────────────────────────── -->
+<section class="concept">
+  <div class="head">
+    <h2>B — Notch</h2>
+    <span class="note">slot cut from the top edge</span>
+  </div>
+  <div class="grid">
+    <div class="stage">
+      <div class="cell"><img src="concept-b.svg" width="256" height="256"><span class="size">256</span></div>
+      <div class="cell"><img src="concept-b-icon.svg" width="128" height="128"><span class="size">icon 128</span></div>
+    </div>
+    <div>
+      <div class="stage">
+        <div class="board dark">
+          <div class="stage">
+            <div class="cell"><img src="concept-b.svg" width="256" height="256"><span class="size">256</span></div>
+            <div class="cell"><img src="concept-b.svg" width="64" height="64"><span class="size">64</span></div>
+            <div class="cell pixelated"><img src="concept-b.svg" width="32" height="32"><span class="size">32</span></div>
+            <div class="cell pixelated"><img src="concept-b.svg" width="16" height="16"><span class="size">16</span></div>
+          </div>
+        </div>
+        <div class="board light">
+          <div class="stage">
+            <div class="cell"><img src="concept-b.svg" width="256" height="256"><span class="size">256</span></div>
+            <div class="cell"><img src="concept-b.svg" width="64" height="64"><span class="size">64</span></div>
+            <div class="cell pixelated"><img src="concept-b.svg" width="32" height="32"><span class="size">32</span></div>
+            <div class="cell pixelated"><img src="concept-b.svg" width="16" height="16"><span class="size">16</span></div>
+          </div>
+        </div>
+      </div>
+      <p class="why" style="margin-top:14px">
+        <b>The idea.</b> The antenna is negative space: a slot cut through the top edge, which is
+        where a notch would be. <b>Why it holds up.</b> Nothing else in this category has a notch, so
+        it is the one detail that cannot be mistaken for a chatbot.
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ── C ─────────────────────────────────────────────────────────────── -->
+<section class="concept">
+  <div class="head">
+    <h2>C — Pocket</h2>
+    <span class="note">capsule · one corner bitten out</span>
+  </div>
+  <div class="grid">
+    <div class="stage">
+      <div class="cell"><img src="concept-c.svg" width="256" height="256"><span class="size">256</span></div>
+      <div class="cell"><img src="concept-c-icon.svg" width="128" height="128"><span class="size">icon 128</span></div>
+    </div>
+    <div>
+      <div class="stage">
+        <div class="board dark">
+          <div class="stage">
+            <div class="cell"><img src="concept-c.svg" width="256" height="256"><span class="size">256</span></div>
+            <div class="cell"><img src="concept-c.svg" width="64" height="64"><span class="size">64</span></div>
+            <div class="cell pixelated"><img src="concept-c.svg" width="32" height="32"><span class="size">32</span></div>
+            <div class="cell pixelated"><img src="concept-c.svg" width="16" height="16"><span class="size">16</span></div>
+          </div>
+        </div>
+        <div class="board light">
+          <div class="stage">
+            <div class="cell"><img src="concept-c.svg" width="256" height="256"><span class="size">256</span></div>
+            <div class="cell"><img src="concept-c.svg" width="64" height="64"><span class="size">64</span></div>
+            <div class="cell pixelated"><img src="concept-c.svg" width="32" height="32"><span class="size">32</span></div>
+            <div class="cell pixelated"><img src="concept-c.svg" width="16" height="16"><span class="size">16</span></div>
+          </div>
+        </div>
+      </div>
+      <p class="why" style="margin-top:14px">
+        <b>The idea.</b> A tall capsule head with one corner bitten out, and the antenna fused to the
+        crown so the whole thing is one silhouette. <b>Why it holds up.</b> It is the only asymmetric
+        mark here — every chat logo is mirrored, and this one is not.
+      </p>
+    </div>
+  </div>
+</section>
+
+<p class="legend">
+  Open this file directly in a browser. The marks are drawn white on transparent; on the light board
+  the image is inverted, so what you judge is one file used in both directions. At 32 and 16 the
+  scaling is <code>image-rendering: pixelated</code> on purpose — that is what Windows actually
+  does to a 16&nbsp;px icon, and a mark that only survives smooth scaling is not a 16&nbsp;px mark.
+  Nothing in this folder is referenced by the app: no build step reads it, and
+  <code>dev/icon/master-b.png</code> is still the app icon's only source.
+</p>
+
+</body>
+</html>

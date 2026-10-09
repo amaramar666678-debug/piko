@@ -51,6 +51,7 @@
       "nsis": {
         "installMode": "currentUser",
         "languages": ["English", "French"],
+        "installerIcon": "icons/icon.ico",
         "installerHooks": "nsis/hooks.nsh"
       }
     }

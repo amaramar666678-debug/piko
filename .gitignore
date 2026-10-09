@@ -17,3 +17,13 @@ src-tauri/gen/schemas/
 # the source tree; kept out of the way under .scratch/ instead.
 *.mojibake-bak
 .scratch/
+
+# The packer's own log, and the scratch an icon or installer experiment leaves
+# behind: decoded installers, extracted PE icons, a rendered preview. All of it
+# is reproducible from a build and none of it is source.
+build.log
+dev/icon/nsis-check/
+dev/icon/oldsetup/
+dev/icon/check-decoder.mjs
+dev/icon/check-encoder.mjs
+dev/icon/preview-ico.png

@@ -9,7 +9,9 @@ import {
   INTEGRATION_AGENTS, MAX_ACTIVE_INTEGRATIONS,
   State, TASK_KINDS, plainName, type AgentTask,
 } from "../core/state";
-import { Bridge } from "../core/bridge";
+import { Bridge, type OpenTarget } from "../core/bridge";
+import * as Connection from "../core/connection";
+import { Sound } from "../core/sound";
 import { washRGBA, type IslandViewName, type Wash } from "../core/layout";
 import { createMiniBot, pruneMiniBots } from "../piko/minibots";
 import { buildPrompt } from "./chat";
@@ -24,8 +26,6 @@ export interface ViewActions {
   collapse(): void;
   setFocus(id: string): void;
   openTerminal(): void;
-  /** The ↗ button: opens whatever the focused pill points at. */
-  openTarget(): void;
   openUrl(url: string): void;
   decide(d: "allow" | "deny"): void;
   /** The MCP card's buttons. `session` is the "for this session" tick. */
@@ -187,17 +187,190 @@ const tabHome = h("button", { class: "tab", title: "Overview", onclick: () => go
 
 // ── Overview ──────────────────────────────────────────────────────────────────
 
+/**
+ * "Open in…" — one button for the default, a caret for the rest.
+ *
+ * What is in the menu is asked of the machine rather than assumed: a target that
+ * is not installed is not offered, and a machine with neither editor says so
+ * instead of presenting two buttons that cannot work. The folder is the one the
+ * task composer is holding, and when there is not one Rust falls back to the last
+ * project a task ran in — and refuses rather than opening somewhere hidden, in
+ * which case we ask.
+ */
+function buildOpenIn(onHeightChange: () => void): { el: HTMLElement; sync(): void } {
+  const label = h("span", { class: "open-in-label", text: "Open in…" });
+  const main = h(
+    "button",
+    { class: "btn primary open-in-main", title: "Open the project folder" },
+    svg(ICONS.arrowUpRight, 10, { stroke: 2.2 }),
+    label,
+  );
+  const caret = h("button", {
+    class: "icon-btn open-in-caret",
+    title: "Other options",
+    "aria-label": "Other options",
+  });
+  clear(caret);
+  caret.append(svg(ICONS.chevronDown, 8));
+  const menu = h("div", { class: "open-in-menu" });
+  const wrap = h("div", { class: "open-in" }, main, caret, menu);
+
+  let targets: OpenTarget[] = [];
+  let loaded = false;
+  // The one request, kept so that a click landing while it is still in flight
+  // waits for the answer instead of reading an empty list and doing nothing.
+  let pending: Promise<void> | null = null;
+  let chosen = State.settings.openInDefault;
+
+  /**
+   * Asked once, and asked straight away rather than when the caret is first
+   * clicked: the button names a target on its face, so a click on it has to do
+   * something even when nobody has ever opened the menu.
+   */
+  const ask = (): Promise<void> => {
+    pending ??= (async () => {
+      try {
+        targets = (await Bridge.openTargets()) ?? [];
+        chosen = targets.find((t) => t.id === chosen)?.id ?? targets[0]?.id ?? "";
+      } catch {
+        targets = [];
+      }
+      loaded = true;
+      State.notify();
+      onHeightChange();
+    })();
+    return pending;
+  };
+
+  const say = (why: string) => {
+    State.noteMessage = why;
+    State.view = "note";
+    State.notify();
+  };
+
+  /** One launch path for the button and for the menu, so both behave the same. */
+  const launch = async (id: string) => {
+    try {
+      await Bridge.openIn(id, State.taskFolder ?? null);
+    } catch (err) {
+      const why = String(err).replace(/^Error:\s*/, "");
+      // "Nothing has ever run here" is not a failure the user can act on without
+      // being asked for a folder, so ask instead of reporting it.
+      if (/no folder chosen/i.test(why)) {
+        const picked = await Bridge.pickFolder();
+        if (!picked) return;
+        State.taskFolder = picked;
+        State.notify();
+        return launch(id);
+      }
+      say(why);
+    }
+  };
+
+  main.addEventListener("click", () => {
+    void ask().then(() => {
+      const target = targets.find((t) => t.id === chosen) ?? targets[0];
+      // Nothing installed: the button already says so, so show what it says —
+      // the menu carries the install links — rather than swallow the click.
+      if (!target) {
+        menu.classList.add("on");
+        State.notify();
+        onHeightChange();
+        return;
+      }
+      void launch(target.id);
+    });
+  });
+
+  caret.addEventListener("click", () => {
+    void ask();
+    const opening = !menu.classList.contains("on");
+    menu.classList.toggle("on", opening);
+    onHeightChange();
+  });
+
+  // The menu closes on the island going away, and on Escape with it — a list that
+  // outlives the panel would be a list nobody can reach.
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && menu.classList.contains("on")) {
+      menu.classList.remove("on");
+      onHeightChange();
+    }
+  });
+
+  // The button is not usable until it knows what this machine has, so the asking
+  // starts here rather than on a click that is already too late to need it.
+  void ask();
+
+  return {
+    el: wrap,
+    sync() {
+      const target = targets.find((t) => t.id === chosen) ?? targets[0];
+      if (!loaded) {
+        label.textContent = "Open in…";
+        return;
+      }
+      if (targets.length === 0) {
+        clear(menu);
+        menu.append(
+          h("div", { class: "open-in-empty", text: "No editor found" }),
+          h("a", {
+            class: "open-in-link",
+            href: "https://code.visualstudio.com/download",
+            text: "Install VS Code",
+          }),
+          h("a", {
+            class: "open-in-link",
+            href: "https://opencode.ai",
+            text: "Install OpenCode",
+          }),
+        );
+        label.textContent = "Nothing to open with";
+        main.classList.add("is-empty");
+        return;
+      }
+      main.classList.remove("is-empty");
+      label.textContent = target ? `Open in ${target.label}` : "Open in…";
+
+      const key = `${targets.map((t) => `${t.id}:${t.id === chosen}`).join("|")}:${menu.classList.contains("on")}`;
+      if (menu.dataset.key === key) return;
+      menu.dataset.key = key;
+      clear(menu);
+      if (!menu.classList.contains("on")) return;
+      for (const t of targets) {
+        const row = h(
+          "button",
+          {
+            class: `open-in-item${t.id === chosen ? " on" : ""}`,
+            onclick: () => {
+              chosen = t.id;
+              State.settings.openInDefault = t.id;
+              void Bridge.saveSettings(State.settings);
+              menu.classList.remove("on");
+              onHeightChange();
+              State.notify();
+            },
+          },
+          h("span", { text: t.label }),
+        );
+        menu.append(row);
+      }
+    },
+  };
+}
+
 function buildOverview(actions: ViewActions, onHeightChange: () => void): ViewHost {
   const ticker = new Ticker();
   const who = h("div", { class: "who" });
   const tickerBody = h("div", { class: "card-body" }, who, ticker.el);
   const leftBody = h("div", { class: "left-body" });
-  const jump = h(
-    "button",
-    { class: "icon-btn jump", title: "Open", onclick: () => actions.openTarget() },
-    svg(ICONS.arrowUpRight, 8),
-  );
-  const left = card(null, leftBody, jump);
+  const openIn = buildOpenIn(onHeightChange);
+  const left = card(null, leftBody, openIn.el);
+  // The card is a column so "Open in…" is a row under the integration rather than a
+  // badge floating in its corner. Absolute placement is what put it on top of the
+  // title, the status line and the button row, and what left the card's own height
+  // as the only thing keeping them apart.
+  left.classList.add("left-card");
   const pills = h("div", { class: "pills" });
   // The 2×2 grid and the "+" are siblings, not grid items: a fifth child would
   // spill onto a third row and be clipped by the card.
@@ -310,13 +483,28 @@ function buildOverview(actions: ViewActions, onHeightChange: () => void): ViewHo
           cardKey = key;
           mode = "card";
           clear(leftBody);
-          leftBody.append(renderIntegrationCard(task, hooks));
+          // `integration_claude` is the carrier for sessions the island did not
+          // start. While one is live the ticker above is the honest card; when one
+          // is not, there is nothing to describe, so it says so rather than
+          // dressing an empty lane up as an integration.
+          leftBody.append(
+            task.id === "integration_claude"
+              ? buildEmpty(actions).el
+              : renderIntegrationCard(task, hooks),
+          );
         }
       }
 
-      jump.style.display = detailOpen ? "none" : "";
+      openIn.sync();
 
-      const others = State.otherTasks.slice(0, MAX_ACTIVE_INTEGRATIONS);
+      // The VS Code integration is not a pill. It is the internal carrier for
+      // activity in sessions the island did not start — approvals, steps, the
+      // ticker — and it stays in `State.tasks` for all of that, but a row of
+      // pills is where a person looks for things they can open, and this one was
+      // never one of them.
+      const others = State.otherTasks
+        .filter((t) => t.id !== "integration_claude")
+        .slice(0, MAX_ACTIVE_INTEGRATIONS);
       const pillKey = others.map((t) => `${t.id}:${t.pillBadge ?? ""}`).join("|");
       if (pillKey !== pillIds) {
         pillIds = pillKey;
@@ -600,8 +788,11 @@ function buildNewTask(actions: ViewActions): ViewHost {
   });
 
   const body = h(
+    // `sticky-top` rather than `auto`: the screen scrolls, and auto-centring a
+    // scrolled column puts its own top out of reach — which put the Back pill on
+    // the "In the row" label and the "Do" section below the frame.
     "div",
-    { class: "stack auto", style: "padding:6px 18px 0 118px" },
+    { class: "stack sticky-top", style: "padding:6px 18px 0 118px" },
     back,
     h("div", { class: "title", text: "New task" }),
     h("div", { class: "sub", text: "Who does it, and how far should they go?" }),
@@ -907,10 +1098,39 @@ function buildError(actions: ViewActions): ViewHost {
   const title = h("div", { class: "title", text: "Workflow stopped." });
   const detail = h("div", { class: "detail" });
   const row = h("div", { class: "actions" },
-    btn("Retry", "primary", () => actions.setView(State.defaultView())),
-    btn("Open in n8n", "secondary", () => actions.openN8n()),
+    btn("Retry", "primary", () => void retryStopped()),
+    btn("Open in n8n", "secondary", () => void Bridge.openN8n()),
   );
   const el = h("div", { class: "view" }, card("red", stack(116, 16, who, title, detail, row)));
+
+  /**
+   * Retry, which used to do nothing but navigate back to the overview.
+   *
+   * The common cause of "Workflow stopped" is that OpenCode was not answering, so
+   * the first thing a retry can honestly do is ask whether it is answering now. If
+   * it is not, the reason is put on screen where Retry and Start OpenCode both
+   * are; if it is, there is nothing to restart from here — the work is gone — so it
+   * goes back to the overview rather than pretending a button did something.
+   */
+  async function retryStopped() {
+    const last = State.focusTask?.steps.at(-1) ?? "";
+    const health = await Connection.check();
+    if (!health?.ok) {
+      // Still nothing there. The room is where Retry and Start OpenCode live, and
+      // the reason is worth more than this card's, so it goes there rather than
+      // leaving a person on an error card whose button has just done nothing.
+      Connection.watch(true);
+      Sound.play("error");
+      actions.setView("prompt");
+      return;
+    }
+    if (Connection.isConnectionFailure(last)) {
+      // It was the connection and the connection is fixed; nothing left to report.
+      Sound.play("approve");
+    }
+    actions.setView(State.defaultView());
+  }
+
   return {
     el,
     sync() {

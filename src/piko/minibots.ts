@@ -41,12 +41,9 @@ export function createMiniBot(task: AgentTask, bodySize: number): HTMLElement {
   engine.isMini = true;
   engine.bodyColor = hexToRGB(task.color);
   engine.setState(task.state, true);
-  if (task.emote) engine.setPermanentEmote(task.emote);
-  if (task.miniEye) {
-    engine.permanentEye = task.miniEye;
-    engine.eyeOverride = task.miniEye;
-    engine.eyeOverrideUntil = Number.POSITIVE_INFINITY;
-  }
+  // A mini follows its state and nothing else. It used to be able to carry a
+  // permanent emote and a permanent eye from `AgentTask.emote` / `.miniEye`, and
+  // nothing ever wrote either field, so the whole path was unreachable.
 
   live.set(canvas, { canvas, engine, cssSize: engineSize, taskId: task.id });
   return slot;

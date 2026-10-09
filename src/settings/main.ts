@@ -67,7 +67,9 @@ function opencodeSection(present: Record<string, boolean>): HTMLElement {
   const test = h("button", { class: "primary", text: "Save & test" });
   test.addEventListener("click", async () => {
     try {
-      if (!settings.managedServer) await saveFields();
+      // Always saved first: "Save & test" is the one button that has to be enough,
+      // so what it tests is what was just typed rather than what was there before.
+      await saveFields();
       const version = await Bridge.opencodeTest();
       note(true, `Connected — OpenCode ${version}`);
     } catch (err) {
@@ -79,7 +81,7 @@ function opencodeSection(present: Record<string, boolean>): HTMLElement {
   detect.addEventListener("click", async () => {
     const found = await Bridge.opencodeDetect();
     if (found) { url.value = found; note(true, `Found a server at ${found}. Press Save & test.`); }
-    else note(false, "No running OpenCode server found. Start one with `opencode serve`, or leave this on the managed server.");
+    else note(false, "No running OpenCode server found. Start one with `opencode serve`.");
   });
 
   const reset = h("button", { class: "danger", text: "Forget credentials" });
@@ -90,52 +92,19 @@ function opencodeSection(present: Record<string, boolean>): HTMLElement {
     note(true, "Credentials removed.");
   });
 
-  // Managed mode owns the URL, the port and the password, so the boxes that set
-  // them have nothing to say while it is on. Hiding them is the honest version of
-  // "recommended": there is nothing to fill in.
-  const manual = h(
-    "div",
+  return h(
+    "section",
     {},
+    h("h2", {}, dot, h("span", { text: "OpenCode" })),
+    h("div", { class: "hint", text:
+      "Point Piko at an OpenCode you start yourself. Piko only reads this address — " +
+      "it will not start, stop or restart anything." }),
+    state,
     h("div", { class: "row" }, h("label", { text: "Server URL" }), url, detect),
     h("div", { class: "row" }, h("label", { text: "Username" }), user),
     h("div", { class: "row" }, h("label", { text: "Password" }), pass),
     h("div", { class: "row" }, test, reset),
     feedback,
-  );
-  const manualHint = h("div", { class: "hint", text:
-    "Point Piko at an OpenCode you start yourself. Piko only reads this address — " +
-    "it will not start, stop or restart anything." });
-
-  const managedHint = h("div", { class: "hint", text:
-    "Piko starts `opencode serve` itself on a free port, with a password it " +
-    "generates and keeps in the Windows Credential Manager. Nothing is written " +
-    "to disk, and the server is stopped when Piko quits." });
-
-  const applyMode = () => {
-    const on = settings.managedServer;
-    managedHint.style.display = on ? "block" : "none";
-    manualHint.style.display = on ? "none" : "block";
-    manual.style.display = on ? "none" : "block";
-  };
-
-  const managedSwitch = toggle(settings.managedServer, (on) => {
-    settings.managedServer = on;
-    void save();
-    applyMode();
-  });
-  applyMode();
-
-  return h(
-    "section",
-    {},
-    h("h2", {}, dot, h("span", { text: "OpenCode" })),
-    h("div", { class: "row" },
-      h("span", { text: "Use managed server (recommended)" }),
-      managedSwitch),
-    managedHint,
-    manualHint,
-    state,
-    manual,
   );
 }
 
@@ -336,6 +305,60 @@ function generalSection(): HTMLElement {
       toggle(settings.miniGrid, (v) => { settings.miniGrid = v; void save(); }),
       h("span", { class: "hint", text: "a row of tiny agents in the island's corner — the cards already list them" }),
     ),
+    openInRow(),
+  );
+}
+
+/**
+ * What the island's "Open in…" button opens.
+ *
+ * The list is what the machine actually has, asked for now rather than read from
+ * the stored default: a target saved on another machine, or one that has since
+ * been uninstalled, is not offered as though it worked. "Automatic" is the
+ * default on purpose — it is the only answer that cannot be wrong about a machine
+ * this settings file was not written on.
+ */
+function openInRow(): HTMLElement {
+  const pick = h("select", {}) as HTMLSelectElement;
+  const hint = h("span", { class: "hint", text: "Checking what is installed…" });
+  const LABELS: Record<string, string> = {
+    "": "Automatic",
+    vscode: "VS Code",
+    "opencode-app": "OpenCode",
+    "opencode-cli": "OpenCode (terminal)",
+  };
+  pick.addEventListener("change", () => {
+    settings.openInDefault = pick.value as Settings["openInDefault"];
+    void save();
+  });
+  void (async () => {
+    let list: { id: string; label: string }[] = [];
+    // A failed ask is its own answer, and it must not fall through into "nothing
+    // found": that reads as a statement about the machine instead of about us.
+    try {
+      list = (await Bridge.openTargets()) ?? [];
+    } catch {
+      hint.textContent = "Could not ask what is installed.";
+      pick.replaceChildren(h("option", { value: "", text: LABELS[""] }));
+      pick.value = "";
+      return;
+    }
+    const here = settings.openInDefault && list.some((t) => t.id === settings.openInDefault);
+    if (settings.openInDefault && !here) settings.openInDefault = "";
+    pick.replaceChildren(
+      ...["", ...list.map((t) => t.id)].map((id) =>
+        h("option", { value: id, text: LABELS[id] ?? id }),
+      ),
+    );
+    pick.value = settings.openInDefault;
+    hint.textContent = list.length
+      ? `${list.length} available — the island offers exactly these`
+      : "Nothing found. The button will say so instead of opening something.";
+  })();
+  return h("div", { class: "row" },
+    h("label", { text: "Open in" }),
+    pick,
+    hint,
   );
 }
 
@@ -581,6 +604,15 @@ async function main() {
 
   void onEvent<Settings>("settings-changed", (s) => {
     settings = { ...settings, ...s };
+  });
+
+  // Escape puts this window away, the same way its close button does. Without it
+  // the key did nothing at all here — the island's handler is on the other window
+  // — and the window stayed up, holding the island out of the way.
+  window.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
+    e.preventDefault();
+    void Bridge.closeSettingsWindow();
   });
 }
 

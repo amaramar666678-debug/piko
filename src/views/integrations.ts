@@ -78,14 +78,9 @@ const STATUS_UI: Record<Status, { color: string; text: string }> = {
 };
 
 /** dot() only takes a colour, so the glow comes from the class on the wrapper. */
-function statusRow(task: AgentTask, info: IntegrationInfo | undefined, status: Status) {
+function statusRow(info: IntegrationInfo | undefined, status: Status) {
   const ui = STATUS_UI[status];
-  const label =
-    status === "error"
-      ? (info?.error ?? ui.text)
-      : task.id === "integration_claude" && status === "missing"
-        ? "No session yet"
-        : ui.text;
+  const label = status === "error" ? (info?.error ?? ui.text) : ui.text;
   const row = h("div", { class: `int-status is-${status}` }, dot(ui.color, 5), h("span", { text: label }));
   return row;
 }
@@ -93,9 +88,6 @@ function statusRow(task: AgentTask, info: IntegrationInfo | undefined, status: S
 function idleCard(task: AgentTask, openSettings: () => void): HTMLElement {
   const info = State.integrations[task.id];
   const configured = info?.configured ?? false;
-  // This pill is a VS Code window with a live OpenCode session in it, not a key
-  // and not a hook script — there is nothing to install. `hooksInstalled` is
-  // pinned true on the Rust side, so this only shows if the session goes away.
   const status = getStatus(info, configured);
   // The prefix is for the places that name the *agent* doing something. A button
   // that opens a dashboard is not that, so it says "Open Vercel" and not
@@ -105,24 +97,13 @@ function idleCard(task: AgentTask, openSettings: () => void): HTMLElement {
   // thing to open yet. It goes to the place that sets it up instead, and says so.
   const missing = status === "missing";
   const verb = missing ? "Set up" : "Open";
-  const target =
-    task.id === "integration_claude" ? "VS Code" : task.id === "integration_n8n" ? "n8n" : name;
+  // `integration_claude` never reaches this card: the overview sends it to the
+  // ticker while a session is live and to the empty state when one is not, so
+  // there is no VS Code row and no "Open VS Code" button left to phrase.
+  const target = task.id === "integration_n8n" ? "n8n" : name;
 
   const actions = h("div", { class: "int-actions" });
-  if (task.id === "integration_claude") {
-    actions.append(
-      h(
-        "button",
-        {
-          class: `btn primary int-open${missing ? " setup" : ""}`,
-          title: missing ? "Add the OpenCode connection Piko talks to" : "Open the folder VS Code is in",
-          onclick: () => (missing ? openSettings() : void Bridge.openInVSCode(task.sessionCwd ?? null)),
-        },
-        svg(missing ? ICONS.sliders : ICONS.arrowUpRight, 10, { stroke: 2.2 }),
-        h("span", { text: missing ? `Set up ${target}` : `Open ${target}` }),
-      ),
-    );
-  } else if (task.id === "integration_n8n") {
+  if (task.id === "integration_n8n") {
     actions.append(
       h(
         "button",
@@ -177,8 +158,8 @@ function idleCard(task: AgentTask, openSettings: () => void): HTMLElement {
     { class: "int-card" },
     // The prefix marks a live agent for places that name the agent doing something.
     // As the title of a card it reads as though the card belongs to one agent.
-    header(task.color, task.id === "integration_claude" ? "VS Code" : name, "Integration"),
-    statusRow(task, info, status),
+    header(task.color, name, "Integration"),
+    statusRow(info, status),
     actions,
   );
 }

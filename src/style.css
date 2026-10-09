@@ -497,6 +497,22 @@ body {
   padding-bottom: 12px;
 }
 
+/* The same thing for a screen that has a sticky Back pill.
+ *
+ * It cannot have the auto margins: a centred flex item that overflows pushes its
+ * own top out of the scroll box, and the sticky pill — which sticks to the top of
+ * that box — then sits on the first label instead of above it. That was "Back"
+ * landing on "In the row", and the same shift is what pushed the "Do" section off
+ * the bottom of the card. Flowing from the top with the pill as the first thing in
+ * the flow gives both back: the pill is above the content rather than on it, and
+ * the whole screen is reachable by scrolling. */
+.stack.sticky-top {
+  height: auto;
+  margin: 0;
+  padding-top: 2px;
+  padding-bottom: 14px;
+}
+
 /* A card split into a scroller and a footer.
  *
  * The new-task screen scrolls — the window is 320 tall and the screen's content is
@@ -709,11 +725,111 @@ body {
   flex: 0 0 auto;
 }
 
-.jump {
+/* ── "Open in…" ───────────────────────────────────────────────────────────── */
+
+/* A row of its own at the foot of the left card, right-aligned. `relative` rather
+   than `absolute`: it keeps the dropdown anchored to the control without taking the
+   control out of the flow, which is the whole of the fix — nothing can be behind it
+   because nothing overlaps it. */
+.open-in {
+  position: relative;
+  flex: 0 0 auto;
+  align-self: flex-end;
+  display: flex;
+  align-items: stretch;
+  gap: 1px;
+  margin: 6px 9px 9px 0;
+}
+
+.open-in-main {
+  padding-right: 9px;
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+  white-space: nowrap;
+}
+
+/* Nothing installed: the button is still there, saying so, because a button that
+   vanishes is a layout that moves under the pointer. */
+.open-in-main.is-empty {
+  background: var(--surface-1);
+  color: var(--dim-3);
+  box-shadow: inset 0 0 0 1px var(--a-07);
+}
+
+.open-in-caret {
+  width: 18px;
+  height: auto;
+  border-radius: 0 var(--r-full) var(--r-full) 0;
+  background: var(--surface-1);
+  color: var(--dim-3);
+  box-shadow: inset 0 0 0 1px var(--a-07);
+}
+
+.open-in-caret:hover {
+  color: var(--ink-2);
+}
+
+/* Opens upward, because the control is the foot of the card and `.card` clips what
+   falls outside it: a dropdown placed below the control was drawn outside the
+   panel and amputated. */
+.open-in-menu {
+  display: none;
   position: absolute;
-  top: 8px;
-  right: 10px;
-  z-index: 2;
+  bottom: calc(100% + 5px);
+  right: 0;
+  min-width: 148px;
+  padding: 4px;
+  border-radius: 10px;
+  background: var(--surface-2);
+  box-shadow: inset 0 0 0 1px var(--a-09), 0 12px 28px -12px var(--a-45);
+  z-index: 5;
+}
+
+.open-in-menu.on {
+  display: block;
+}
+
+.open-in-item {
+  display: block;
+  width: 100%;
+  padding: 6px 9px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--ink-2);
+  font: 500 11.5px var(--font);
+  text-align: left;
+  cursor: pointer;
+}
+
+.open-in-item:hover {
+  background: var(--a-09);
+  color: var(--ink);
+}
+
+.open-in-item.on {
+  color: var(--ink);
+  box-shadow: inset 0 0 0 1px var(--a-09);
+}
+
+.open-in-empty,
+.open-in-link {
+  display: block;
+  padding: 4px 9px;
+  font-size: 11px;
+}
+
+.open-in-empty {
+  color: var(--dim-3);
+}
+
+.open-in-link {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.open-in-link:hover {
+  text-decoration: underline;
 }
 
 /* Ticker */
@@ -1604,10 +1720,23 @@ input[type="range"]::-webkit-slider-thumb {
 
 /* ── Integration cards (overview, left card) ────────────────────────────── */
 
+/* The card is a column: the focused integration fills the space above, "Open in…"
+   is a row of its own below it. It was absolutely positioned in the corner, and an
+   absolute box is only kept clear of the flow by whatever the flow happens to do —
+   which is why it ended up over the title, the status line and the button row
+   depending on how tall the card was. In flow with a gap, none of that is
+   reachable at any height. */
+.left-card {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
 .left-body {
   position: relative;
   z-index: 1;
-  height: 100%;
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
 .int-card {
@@ -1621,12 +1750,20 @@ input[type="range"]::-webkit-slider-thumb {
   align-items: center;
   gap: 6px;
   min-width: 0;
-  padding-right: 24px;
 }
 
+/* The title truncates rather than running under anything. It used to carry a
+   `padding-right: 24px` to clear the corner arrow that has since moved into the
+   card's footer row; with nothing in the corner any more that was dead space, and
+   the name still had no ellipsis, so a long integration name was clipped mid-word
+   by the card edge. */
 .int-head b {
   font: var(--fw-semi) var(--fs-md) var(--font);
   color: var(--ink);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .int-head > span {
@@ -2338,7 +2475,17 @@ input[type="range"]::-webkit-slider-thumb {
   color: var(--ink-2);
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
+  /* Wraps rather than truncating: this text is the answer to "why does nothing
+     work", and an ellipsis on the reason hides the reason. The row is `nowrap`
+     only for the buttons, which sit beside it and must not be pushed off. */
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+/* The row is two buttons wide at its widest (a failure with a server to start), so
+   it is allowed to wrap rather than squeeze the message into nothing. */
+.agent-problem {
+  flex-wrap: wrap;
 }
 
 .agent-retry {
@@ -2367,6 +2514,18 @@ input[type="range"]::-webkit-slider-thumb {
 .agent-retry svg {
   display: block;
   color: var(--amber);
+}
+
+/* Start OpenCode. The one action in the room that changes the machine rather than
+   asking it something, so it is the filled one: amber on amber, the same colour as
+   the row it sits in. */
+.agent-start {
+  background: color-mix(in srgb, var(--amber) 26%, transparent);
+  color: var(--ink);
+}
+
+.agent-start:hover {
+  background: color-mix(in srgb, var(--amber) 38%, transparent);
 }
 
 /* ── Who is answering ──────────────────────────────────────────────────────── */

@@ -44,6 +44,7 @@ installs for the current user only — no admin prompt.
 | Click Mochi | It gets annoyed. Three times in a row and it goes dizzy |
 | Rest the pointer on Mochi for two seconds | Hearts |
 | Drag a file onto the island | Mochi turns into a box, swallows it, then offers to answer questions about it |
+| Click **Open in…** | Opens the project folder in whichever editor this machine actually has — the caret picks which one |
 | `Esc` | Closes the island |
 | Tray icon | Open, Settings…, Pause, Quit |
 
@@ -55,14 +56,17 @@ your integrations sit in the coloured pills next to Mochi.
 
 <img src="screenshots/settings.png" width="562" alt="The settings window">
 
-Open **Settings… → OpenCode**. It is a switch, not a form: on the default
-**managed** side Piko owns the server it talks to — it finds the CLI, asks the OS
-for a free loopback port, mints a password with the system CSPRNG, runs
-`opencode serve` as a windowless child that dies with Piko, and brings it back up
-to three times if it falls over. On the **manual** side you give it a URL, a
-username and a password, with **Auto-detect** for an OpenCode that is already
-running and **Save & test** to check them. Every one of those values lives in the
-Windows Credential Manager, never on disk and never in the interface.
+Open **Settings… → OpenCode**. Piko talks to an OpenCode **you** start — there is
+no server of its own to run, and nothing for it to leave behind when it quits.
+Give it a URL, a username and a password, with **Auto-detect** for an OpenCode
+that is already running (`opencode serve`) and **Save & test** to check them. Every
+one of those values lives in the Windows Credential Manager, never on disk and
+never in the interface.
+
+Start with **Auto-detect**: on the first launch after updating from a build that
+started its own server, the address that build generated is dropped — it pointed
+at a port this version has nothing to listen on — and Piko falls back to
+`http://127.0.0.1:4096` until you save one of your own.
 
 There is no relay executable and nothing is installed into Claude Code's
 `settings.json`: the island and the agent talk to the same server over HTTP, and a

@@ -1,4 +1,4 @@
-﻿// The island: DOM shell, sizing animation, Piko placement, mouse handling.
+// The island: DOM shell, sizing animation, Piko placement, mouse handling.
 // Mirrors IslandRootView.swift + IslandWindowController.swift.
 
 import { Tracked, Spring, clamp } from "../core/anim";
@@ -95,6 +95,16 @@ export class Island {
   /** Drop sequence bookkeeping: last tick played, and whether the ✓ has fired. */
   private uploadTens = 0;
   private uploadDone = false;
+  /**
+   * The drop panel's own idle countdown.
+   *
+   * The panel no longer collapses on a blur or an outside press, so it needs a way
+   * out of its own accord: a minute of nobody touching it. That is deliberately
+   * longer than the panel's normal 15 s auto-close, because a drop takes as long as
+   * finding the file takes.
+   */
+  private dropIdleTimer: number | null = null;
+  private static readonly DROP_IDLE_MS = 60_000;
 
   constructor(root: HTMLElement) {
     this.root = root;
@@ -124,7 +134,11 @@ export class Island {
   private syncHold() {
     const talking =
       State.view === "prompt" && (State.chatBusy || State.chatHistory.length > 0);
-    this.fsm.setHold(talking);
+    // The drop panel is a target for a gesture that happens in another window
+    // entirely, so the cursor leaving — which is what arms the auto-close — means
+    // nothing here. Holding it keeps the panel put until the drop lands or the
+    // idle timer fires.
+    this.fsm.setHold(talking || this.dropPanelOpen || State.fileDragOver);
   }
 
   // ── DOM ─────────────────────────────────────────────────────────────────────
@@ -142,22 +156,8 @@ export class Island {
         const cwd = State.focusTask?.sessionCwd ?? null;
         void Bridge.openInVSCode(cwd);
       },
-      // The ↗ button — same targets as openAgentTarget() on macOS.
-      openTarget: () => {
-        const task = State.focusTask;
-        if (!task) return;
-        const urls: Record<string, string> = {
-          integration_resend: "https://resend.com/emails",
-          integration_vercel: "https://vercel.com/dashboard",
-          integration_github: "https://github.com",
-          integration_stripe: "https://dashboard.stripe.com/payments",
-          integration_notion: "https://notion.so",
-          integration_calcom: "https://app.cal.com/bookings",
-        };
-        if (task.id === "integration_claude") void Bridge.openInVSCode(task.sessionCwd ?? null);
-        else if (task.id === "integration_n8n") void Bridge.openN8n();
-        else if (urls[task.id]) void Bridge.openUrl(urls[task.id]);
-      },
+      // The ↗ that opened "whatever the focused pill points at" is gone: the left
+      // card now carries "Open in…", which is a folder rather than a dashboard.
       openUrl: (url) => {
         if (url) void Bridge.openUrl(url);
       },
@@ -246,9 +246,8 @@ export class Island {
     // the header, which stays visible on top of it exactly as on macOS.
     this.uploadCanvas = new UploadCanvas({
       ask: () => {
-        State.promptContext = State.droppedFile
-          ? { kind: "file", name: State.droppedFile.name, path: State.droppedFile.path }
-          : null;
+        // The room reads `State.droppedFile` itself when the first message is
+        // sent, so there is nothing to carry across here.
         this.setView("prompt");
       },
       cancel: () => this.setView(State.defaultView()),
@@ -423,9 +422,45 @@ export class Island {
     return State.mode === "expanded" && UploadSeq.isActive && UPLOAD_VIEWS.has(State.view);
   }
 
+  /**
+   * Whether the drop panel is the thing on screen.
+   *
+   * This is the guard for every way the island used to fold itself away in the
+   * middle of a drop: a press outside it (the press that *starts* the drag, in
+   * Explorer), the cursor leaving it (which arms the auto-close), and the blur
+   * that follows. All three fire while the person is reaching for a file, which
+   * is the one gesture the panel exists for, so the panel has to outlive all of
+   * them.
+   */
+  private get dropPanelOpen(): boolean {
+    return State.mode === "expanded" && UPLOAD_VIEWS.has(State.view);
+  }
+
   /** Navigating out of the drop flow ends the sequence, as on macOS. */
   private stopSequenceIfLeaving(view: IslandViewName) {
     if (UploadSeq.isActive && !UPLOAD_VIEWS.has(view)) UploadSeq.deactivate();
+  }
+
+  /**
+   * Re-arms the drop panel's idle countdown, and is also the "the panel is being
+   * used" signal.
+   *
+   * Called for anything that counts as interacting with the panel — a press inside
+   * it, a drop, arriving at it — and never for raw cursor movement, which is the
+   * whole point: the pointer spends the entire drag in another window, and a timer
+   * that any mouse movement anywhere on the machine refreshed would never expire.
+   */
+  private touchDropPanel() {
+    if (this.dropIdleTimer != null) window.clearTimeout(this.dropIdleTimer);
+    this.dropIdleTimer = null;
+    if (!this.dropPanelOpen) return;
+    this.dropIdleTimer = window.setTimeout(() => {
+      this.dropIdleTimer = null;
+      // Re-checked at the fire, not only at the arm: a panel the person has
+      // switched away from must not be folded by a timer it was never meant to
+      // keep.
+      if (this.dropPanelOpen) this.collapse();
+    }, Island.DROP_IDLE_MS);
   }
 
   expand(view: IslandViewName) {
@@ -435,6 +470,7 @@ export class Island {
     else this.animateGeometry(false);
     State.lastActivity = performance.now();
     this.homeCollapseAt = null;
+    this.touchDropPanel();
     State.notify();
   }
 
@@ -444,6 +480,7 @@ export class Island {
       this.fsm.forceHome();
       State.view = view;
       this.animateGeometry(false);
+      this.touchDropPanel();
       State.notify();
       return;
     }
@@ -451,6 +488,7 @@ export class Island {
     State.view = view;
     State.lastActivity = performance.now();
     this.animateGeometry(!grew);
+    this.touchDropPanel();
     State.notify();
   }
 
@@ -469,6 +507,10 @@ export class Island {
   outsideClick() {
     if (State.mode !== "expanded") return;
     if (State.isPinned || this.drag) return;
+    // The press that starts a drop lands in Explorer, not here, so the dismissal
+    // arrives before the drag has moved a pixel. `State.fileDragOver` covers the
+    // moment the island is on screen but the sequence has not begun.
+    if (this.dropPanelOpen || State.fileDragOver) return;
     this.collapse();
   }
 
@@ -556,16 +598,20 @@ export class Island {
     switch (e.type) {
       case "enter":
       case "over": {
+        this.touchDropPanel();
         if (State.fileDragOver) return;
         State.fileDragOver = true;
         this.engine.animateMorph(1);
         // enterZone must run before the island expands, so the sequence is
         // already active by the time the view becomes `upload`.
         UploadSeq.enterZone(State.mouseInIsland.x, State.mouseInIsland.y);
+        // A drop onto the collapsed head arrives here with nothing on screen but
+        // the bubble, so this is the only thing that can open the window for it.
         this.alert("upload");
         break;
       }
       case "leave": {
+        this.touchDropPanel();
         if (!State.fileDragOver) return;
         State.fileDragOver = false;
         this.engine.animateMorph(0);
@@ -575,6 +621,7 @@ export class Island {
         break;
       }
       case "drop": {
+        this.touchDropPanel();
         State.fileDragOver = false;
         const path = e.paths?.[0];
         if (!path) {
@@ -596,7 +643,6 @@ export class Island {
   private swallow(path: string) {
     const name = path.split(/[\\/]/).pop() || "file";
     State.droppedFile = { name, path };
-    State.promptContext = { kind: "file", name, path };
     State.chatHistory = [];
     void Bridge.chatReset();
 
@@ -616,7 +662,6 @@ export class Island {
     void Bridge.ingestFile(path)
       .then((file) => {
         State.droppedFile = { name: file.name, path: file.path };
-        State.promptContext = { kind: "file", name: file.name, path: file.path };
         State.notify();
       })
       .catch((err) => {
@@ -806,14 +851,25 @@ const rect = this.islandRect();
         }
       if (this.isBotHit(e.clientX, e.clientY)) {
         this.cancelBotHover();
+        // On the drop panel the head is the way out rather than a toy to slap:
+        // the panel ignores every other dismissal so the drag can happen, and this
+        // is what is left of them.
+        if (this.dropPanelOpen) {
+          this.collapse();
+          return;
+        }
         this.engine.slap();
         return;
       }
       // A click on the bare backdrop collapses the island — the usual way out of
       // a panel that opened itself. A click on a card, a button or the header is
       // content, not empty space, and must be left alone; the listener is in the
-      // bubble phase so it sees those too.
-      if (!State.isPinned && this.isBackgroundClick(e.target)) this.collapse();
+      // bubble phase so it sees those too. The drop panel is exempt: its whole
+      // purpose is to be looked at while doing something else.
+      if (!State.isPinned && !this.dropPanelOpen && this.isBackgroundClick(e.target)) {
+        this.collapse();
+      }
+      this.touchDropPanel();
     });
 
     window.addEventListener("keydown", (e) => {
@@ -1018,7 +1074,7 @@ const rect = this.islandRect();
     }
     if (!inIsland && this.wasInIsland) {
       this.fsm.mouseLeft();
-      if (this.fsm.state === "home" && !State.isPinned) {
+      if (this.fsm.state === "home" && !State.isPinned && !this.dropPanelOpen) {
         this.homeCollapseAt = performance.now() + State.settings.autoCloseInterval * 1000;
       }
     }

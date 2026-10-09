@@ -12,7 +12,6 @@
 // response bodies are never logged; /config/providers is never called.
 
 use std::collections::{HashMap, HashSet};
-use std::os::windows::io::AsRawHandle;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -82,8 +81,11 @@ fn status_hint(s: StatusCode) -> String {
 }
 
 /// The "Test connection" button. Returns the OpenCode version.
-pub async fn test(app: AppHandle) -> Result<String, String> {
-    ensure(&app).await;
+///
+/// Nothing is started here, deliberately. Piko no longer owns an OpenCode: it
+/// talks to one somebody else is running, at an address the person gave it, so a
+/// failed test is a statement about that address and not about Piko's own state.
+pub async fn test() -> Result<String, String> {
     let c = conn();
     let rb = authed(
         &c,
@@ -92,12 +94,15 @@ pub async fn test(app: AppHandle) -> Result<String, String> {
             .timeout(Duration::from_secs(4)),
     );
     let res = rb.send().await.map_err(|e| {
-        // Nothing there and no CLI to start: say which of the two it is. A bare
-        // "unreachable" sends people looking at Piko instead of at their PATH.
-        if app.state::<Managed>().cli_missing() {
-            install_hint()
+        // Two different mistakes look identical from here: OpenCode is not
+        // installed at all, or it is installed and not at this address. Saying
+        // which is the whole value of the message, and "unreachable" on its own
+        // sends people looking at Piko instead of at their own address.
+        let detail = format!("unreachable at {} ({})", c.url, e.without_url());
+        if cli().is_none() {
+            format!("{detail} — {}", install_hint())
         } else {
-            format!("unreachable at {} ({})", c.url, e.without_url())
+            format!("{detail}. Is that the address your OpenCode is on?")
         }
     })?;
     if !res.status().is_success() {
@@ -1271,70 +1276,34 @@ fn base64(bytes: &[u8]) -> String {
     out
 }
 
-// -- managed server -----------------------------------------------------------
+// -- finding the OpenCode CLI ------------------------------------------------
 //
-// The default: Piko owns the OpenCode it talks to. On start it looks for the
-// CLI on PATH, asks the OS for a free loopback port, generates a password from
-// the CSPRNG, and runs `opencode serve` as a windowless child of this process.
-// The password goes to the Credential Manager and nowhere else - not the
-// command line, not an environment block we wrote down, not the log. The child
-// is stopped when Piko exits, and brought back up to three times if it falls
-// over on its own.
-//
-// The URL is published through `secrets::set("opencode-url")` so that `conn()`
-// and every existing caller keep working unchanged: managed mode is the same
-// connection, arranged for us.
+// Piko does not start a server any more. It talks to one that is already running,
+// at an address the person gave it or picked with Auto-detect. What is left of the
+// old managed machinery is the one thing still needed: the path to the `opencode`
+// binary, used to open a project in it.
 
-/// How many times a fallen server is brought back before giving up. Past this it
-/// is a crash loop in the CLI, and retrying forever would just hide it.
-const MAX_RESTARTS: u32 = 3;
-
-/// `CREATE_NO_WINDOW`. A console app started from a GUI app without this flashes
-/// a black window on every launch, including every restart.
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-struct Inner {
-    child: Option<std::process::Child>,
-    /// Tied to the child above. Dropping it kills the server, so an unclean exit
-    /// does not leave one behind.
-    job: Option<KillOnDrop>,
-    port: Option<u16>,
-    /// Held in memory only, so a restart reuses the password already sitting in
-    /// the Credential Manager instead of writing a new one on every crash.
-    password: Option<String>,
-}
-
-pub struct Managed {
-    inner: std::sync::Mutex<Inner>,
-    stopping: std::sync::atomic::AtomicBool,
-    /// One supervisor at a time. The switch can be flipped on and off in a
-    /// session, and a second thread watching the same child would double every
-    /// restart.
-    supervising: std::sync::atomic::AtomicBool,
-    restarts: std::sync::atomic::AtomicU32,
-    /// No CLI on PATH. Tracked so the UI can say "install it" instead of the
-    /// useless "unreachable".
-    no_cli: std::sync::atomic::AtomicBool,
-}
-
-impl Managed {
-    pub const fn new() -> Self {
-        Self {
-            inner: std::sync::Mutex::new(Inner {
-                child: None,
-                job: None,
-                port: None,
-                password: None,
-            }),
-            stopping: std::sync::atomic::AtomicBool::new(false),
-            supervising: std::sync::atomic::AtomicBool::new(false),
-            restarts: std::sync::atomic::AtomicU32::new(0),
-            no_cli: std::sync::atomic::AtomicBool::new(false),
-        }
+/// The one thing left to do about the managed era.
+///
+/// That era wrote `opencode-url` — a loopback port it had picked for a server it
+/// then stopped on exit — into the Credential Manager. Keeping the value would
+/// leave Piko pointed at a dead port for ever, failing in a way that reads like a
+/// bug rather than like a setting nobody chose any more. So it is dropped once, and
+/// `conn()` falls back to the default address until somebody saves a real one.
+///
+/// Only when the settings file says the install was managed: a URL somebody typed
+/// is theirs, however unreachable it looks, and guessing at that would be Piko
+/// rewriting a preference behind their back.
+pub fn forget_managed_connection(was_managed: bool) {
+    if !was_managed || secrets::get("opencode-url").is_none() {
+        return;
     }
-
-    pub fn cli_missing(&self) -> bool {
-        self.no_cli.load(std::sync::atomic::Ordering::Relaxed)
+    // `set` with an empty value deletes the entry, which is the whole operation.
+    match secrets::set("opencode-url", "") {
+        Ok(()) => log::line(
+            "dropped the URL the managed server left behind - set yours in Settings -> OpenCode",
+        ),
+        Err(e) => log::line(&format!("could not drop the managed OpenCode URL: {e}")),
     }
 }
 
@@ -1362,7 +1331,7 @@ fn run_rank(path: &std::path::Path) -> u8 {
 /// shims. PATH comes first, then the two directories npm puts its global shims
 /// in, because a machine that installed OpenCode without adding `%APPDATA%\npm`
 /// to PATH has the CLI sitting right there and PATH is simply lying about it.
-fn cli() -> Option<std::path::PathBuf> {
+pub fn cli() -> Option<std::path::PathBuf> {
     let mut found: Option<std::path::PathBuf> = None;
     let mut consider = |dir: std::path::PathBuf| {
         for name in ["opencode.exe", "opencode.cmd", "opencode.bat", "opencode"] {
@@ -1391,50 +1360,6 @@ fn cli() -> Option<std::path::PathBuf> {
     found
 }
 
-/// A port the OS says is free right now. Binding to 0 and reading back the port
-/// is the only race-free way to ask; the socket is dropped immediately, so the
-/// child has to win a very short game of chance on bind.
-fn free_port() -> Option<u16> {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .ok()?
-        .local_addr()
-        .ok()
-        .map(|a| a.port())
-}
-
-/// 48 characters from a CSPRNG - about 285 bits - over an alphabet with no
-/// quoting or escaping in it, because it has to survive being an argument to
-/// somebody else's process launcher.
-fn random_password() -> Option<String> {
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    let mut bytes = [0u8; 48];
-    // BCRYPT_USE_SYSTEM_PREFERRED_RNG. A NULL algorithm handle is only allowed
-    // together with this flag; without it the call comes back
-    // STATUS_INVALID_HANDLE and there is no password at all.
-    const BCRYPT_USE_SYSTEM_PREFERRED_RNG:
-        windows::Win32::Security::Cryptography::BCRYPTGENRANDOM_FLAGS =
-        windows::Win32::Security::Cryptography::BCRYPTGENRANDOM_FLAGS(0x0000_0002);
-    // SAFETY: `bytes` is live and exactly `len` long, which is what
-    // BCryptGenRandom requires of the buffer it fills.
-    let status = unsafe {
-        windows::Win32::Security::Cryptography::BCryptGenRandom(
-            None,
-            &mut bytes,
-            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-        )
-    };
-    // NTSTATUS: 0 is success.
-    if status.0 != 0 {
-        return None;
-    }
-    Some(
-        bytes
-            .iter()
-            .map(|b| ALPHABET[*b as usize % ALPHABET.len()] as char)
-            .collect(),
-    )
-}
-
 /// One `/global/health` answer: the version, or None for "not a working server".
 async fn probe(url: &str, c: &Conn) -> Option<String> {
     let res = authed(
@@ -1458,26 +1383,135 @@ async fn probe(url: &str, c: &Conn) -> Option<String> {
     })
 }
 
-/// Poll `/global/health` until it answers or the attempts run out. The server is
-/// a separate process starting up in parallel, so the first few goes always miss.
-async fn await_healthy(url: &str, c: &Conn) -> Option<String> {
-    let mut delay = 120u64;
-    for _ in 0..9 {
-        if let Some(v) = probe(url, c).await {
-            return Some(v);
-        }
-        tokio::time::sleep(Duration::from_millis(delay)).await;
-        delay = (delay * 2).min(1_000);
-    }
-    None
+// ── Connection: health, start, reconnect ──────────────────────────────────────
+//
+// Piko does not own an OpenCode (see above), but "not running" is still a state it
+// has to answer honestly: what the address is, whether anything answers it, and —
+// when the person asks for it — a way to start one. Everything here is opt-in from
+// the island; nothing is started on its own.
+
+/// `CREATE_NO_WINDOW`. A console app launched from a GUI app without it flashes a
+/// black window on every attempt.
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// How long a single health check may take before it counts as "not there".
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(4);
+/// How long to keep waiting for a server Piko just started.
+const START_WAIT: Duration = Duration::from_secs(25);
+
+/// What the island shows about the connection.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Health {
+    pub ok: bool,
+    pub url: String,
+    pub version: Option<String>,
+    /// Why it failed, in the server's own words where it has any.
+    pub reason: Option<String>,
+    /// The `opencode` program is not installed — a different problem from "not
+    /// running", and the only one no amount of retrying will fix.
+    pub cli_missing: bool,
 }
 
-/// Start `opencode serve` on `port` with `password`, windowless.
-fn spawn_server(
-    cli: &std::path::Path,
-    port: u16,
-    password: &str,
-) -> std::io::Result<std::process::Child> {
+/// One health check against the configured address, with the reason kept.
+///
+/// The reason is the point. "Unreachable" on its own sends people looking at Piko
+/// instead of at their own machine, and `reqwest`'s own text ("error sending
+/// request") says nothing at all, so the underlying cause is logged verbatim and
+/// the short form is what the interface shows.
+pub async fn health() -> Health {
+    let c = conn();
+    let mut out = Health {
+        ok: false,
+        url: c.url.clone(),
+        version: None,
+        reason: None,
+        cli_missing: cli().is_none(),
+    };
+    let res = match authed(
+        &c,
+        http()
+            .get(format!("{}/global/health", c.url))
+            .timeout(HEALTH_TIMEOUT),
+    )
+    .send()
+    .await
+    {
+        Ok(res) => res,
+        Err(e) => {
+            // The whole error, source chain included: `error sending request` is
+            // the top of a reqwest error whose bottom is the reason it failed.
+            let detail = format!("{e:#}");
+            log::line(&format!("opencode health at {} failed: {detail}", c.url));
+            out.reason = Some(match &out.cli_missing {
+                true => install_hint(),
+                false => format!("{detail} — nothing is answering at {}", c.url),
+            });
+            return out;
+        }
+    };
+    if !res.status().is_success() {
+        let why = status_hint(res.status());
+        log::line(&format!("opencode health at {} said {why}", c.url));
+        out.reason = Some(why);
+        return out;
+    }
+    let v: Value = match res.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            log::line(&format!("opencode health at {} was not json: {e}", c.url));
+            out.reason = Some(format!("unexpected answer from {}", c.url));
+            return out;
+        }
+    };
+    match v.get("healthy").and_then(Value::as_bool) {
+        Some(true) => {
+            let version = v
+                .get("version")
+                .and_then(Value::as_str)
+                .unwrap_or("?")
+                .to_string();
+            log::line(&format!("opencode connected at {} ({version})", c.url));
+            out.ok = true;
+            out.version = Some(version);
+        }
+        _ => out.reason = Some(format!("{} answers but reports itself unhealthy", c.url)),
+    }
+    out
+}
+
+/// The port the configured URL names — the one thing `opencode serve` needs.
+///
+/// Parsed out of the address rather than stored separately, so there is a single
+/// place the port can live and it cannot drift from the URL.
+pub fn port_of(url: &str) -> Option<u16> {
+    let after = url.split_once("://")?.1;
+    let hostport = after.split('/').next()?;
+    hostport
+        .rsplit_once(':')?
+        .1
+        .parse::<u16>()
+        .ok()
+        .filter(|p| *p > 0)
+}
+
+/// The `opencode serve` this process started, if it started one.
+///
+/// Held so it can be stopped on the way out — and only then. An OpenCode the person
+/// started themselves belongs to them, and killing it because the overlay is
+/// quitting would be the worst possible answer to "quit Piko".
+static OWNED: std::sync::OnceLock<Mutex<Option<std::process::Child>>> =
+    std::sync::OnceLock::new();
+
+fn owned() -> &'static Mutex<Option<std::process::Child>> {
+    OWNED.get_or_init(|| Mutex::new(None))
+}
+
+/// `opencode serve --hostname 127.0.0.1 --port <port>`, windowless.
+///
+/// npm installs `opencode.cmd` rather than an `.exe`, which CreateProcess cannot
+/// run, so a shim goes through `cmd.exe` — which then makes cmd the tracked child.
+fn spawn_server(cli: &std::path::Path, port: u16) -> std::io::Result<std::process::Child> {
     use std::os::windows::process::CommandExt;
     let args = [
         "serve",
@@ -1489,11 +1523,7 @@ fn spawn_server(
     let shimmed = cli
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"));
-
     let mut cmd = if shimmed {
-        // npm installs `opencode.cmd`, not an .exe. Running it through the shell
-        // is the only way, which leaves cmd.exe as the tracked child - so
-        // stopping has to go through `kill_tree` to reach the real server.
         let mut c = std::process::Command::new("cmd.exe");
         c.arg("/C").arg(cli).args(args);
         c
@@ -1502,339 +1532,148 @@ fn spawn_server(
         c.args(args);
         c
     };
-
-    cmd.env("OPENCODE_SERVER_PASSWORD", password)
-        // Null, not piped: a pipe nobody drains fills up and wedges the child, and a
-        // log line could carry anything the server decides to print.
-        .stdin(std::process::Stdio::null())
+    // Null rather than piped: a pipe nobody drains fills and wedges the child, and
+    // a log line could carry anything the server prints.
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .creation_flags(CREATE_NO_WINDOW);
     cmd.spawn()
 }
 
-/// Kill `pid` and everything it started.
+/// Stops the server this process started, and only that one.
 ///
-/// A managed server reached through an npm shim is a grandchild of us, and
-/// `Child::kill` only ever reaches the child. `taskkill /T` is the one documented
-/// way to take a tree down in a single call, and it is worth the extra process:
-/// the alternative is leaking an `opencode serve` that outlives Piko and holds
-/// the port, so the next launch fails for a reason nobody can see.
-fn kill_tree(pid: u32) {
+/// Called on the way out. `taskkill /T` rather than `Child::kill` because a server
+/// reached through an npm shim is a grandchild, and `Child::kill` only ever reaches
+/// the child — leaking an `opencode serve` that holds the port is worse than the
+/// extra process.
+pub fn shutdown_owned() {
+    let mut slot = owned().lock().unwrap();
+    let Some(mut child) = slot.take() else {
+        return;
+    };
     use std::os::windows::process::CommandExt;
     let _ = std::process::Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .args(["/PID", &child.id().to_string(), "/T", "/F"])
         .creation_flags(CREATE_NO_WINDOW)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
+    let _ = child.wait();
+    log::line("stopped the OpenCode Piko started");
 }
 
-/// A job object with `KILL_ON_JOB_CLOSE`, which is the only cleanup that survives
-/// Piko being killed rather than closed.
+/// Starts an OpenCode, if the person asked for one and there is not one already.
 ///
-/// Every other mechanism here is cooperative: the `Exit` handler runs on a normal
-/// quit, and `taskkill` runs when we decide to stop the child. A crash, a
-/// `Stop-Process`, or a panic skips both, and the `opencode serve` we started
-/// stays on its port with nobody left holding the handle. Windows closes our
-/// handles for us when the process dies for any reason, and closing this one
-/// takes the server with it.
-struct KillOnDrop(windows::Win32::Foundation::HANDLE);
-
-// A job handle is a process-wide kernel object, not something bound to the thread
-// that opened it. `HANDLE` is a raw pointer and so refuses to cross threads on its
-// own; this is the assertion that ours only closes, and only under the `Managed`
-// mutex or on the way out of a thread that created it.
-unsafe impl Send for KillOnDrop {}
-
-impl KillOnDrop {
-    /// A job that kills `child` and anything it spawns when the returned handle is
-    /// closed. `None` when the job could not be made, which costs crash cleanup
-    /// but nothing else.
-    fn new_with(child: &std::process::Child) -> Option<Self> {
-        use windows::Win32::System::JobObjects::{
-            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        };
-
-        // SAFETY: null name and null attributes ask for an unnamed job with
-        // default security, which is all this needs.
-        let handle = unsafe { CreateJobObjectW(None, None) }.ok()?;
-
-        // SAFETY: `info` is fully initialised below and the length matches it,
-        // which is the contract SetInformationJobObject requires.
-        let configured = unsafe {
-            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            SetInformationJobObject(
-                handle,
-                JobObjectExtendedLimitInformation,
-                &info as *const _ as *const std::ffi::c_void,
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            )
-            .is_ok()
-        };
-        if !configured {
-            // Nothing is in the job yet, so closing it cannot hurt anything.
-            let _ = unsafe { windows::Win32::Foundation::CloseHandle(handle) };
-            return None;
-        }
-
-        // SAFETY: `child` is alive here, so its process handle is valid. A
-        // failure is survivable: the child is still tracked directly and
-        // `taskkill` still cleans up on a normal quit.
-        unsafe {
-            let _ = AssignProcessToJobObject(
-                handle,
-                windows::Win32::Foundation::HANDLE(child.as_raw_handle() as _),
-            );
-        }
-        Some(Self(handle))
+/// The health check comes first and is the point: Piko talks to an address the
+/// person owns, and "start one" must never mean "start a second one" next to a
+/// server that is already answering. Only a server this call started is ever
+/// stopped by [`shutdown_owned`].
+pub async fn start_server() -> Result<String, String> {
+    let before = health().await;
+    if before.ok {
+        // Already there. Saying so is the whole answer — starting a rival on the
+        // same port would fail, or worse, bind somewhere else.
+        return Ok(before.version.unwrap_or_else(|| "?".into()));
     }
-}
-
-impl Drop for KillOnDrop {
-    fn drop(&mut self) {
-        // SAFETY: we own this handle and this is its only close.
-        unsafe {
-            let _ = windows::Win32::Foundation::CloseHandle(self.0);
-        }
-    }
-}
-
-/// Everything one launch needs: find the CLI, mint a port and a password, start
-/// the child, publish the URL, and wait for it to be genuinely healthy.
-async fn launch(m: &Managed) -> Result<String, String> {
     let Some(cli) = cli() else {
-        m.no_cli.store(true, std::sync::atomic::Ordering::Relaxed);
         return Err(install_hint());
     };
-    m.no_cli.store(false, std::sync::atomic::Ordering::Relaxed);
-
-    // A password is only minted once. On a restart the one already in the
-    // Credential Manager is reused, so the child and Piko cannot disagree.
-    let password = {
-        let mut inner = m.inner.lock().unwrap();
-        if inner.password.is_none() {
-            inner.password = random_password();
-        }
-        inner
-            .password
-            .clone()
-            .ok_or_else(|| "could not generate a password".to_string())?
-    };
-
-    let port = free_port().ok_or_else(|| "no free port".to_string())?;
-    let url = format!("http://127.0.0.1:{port}");
-    let child = spawn_server(&cli, port, &password).map_err(|e| e.to_string())?;
-    let job = KillOnDrop::new_with(&child);
-
-    {
-        let mut inner = m.inner.lock().unwrap();
-        // Replacing the old job closes its handle, which kills the server that
-        // was launched before the new one is recorded.
-        inner.child = Some(child);
-        inner.job = job;
-        inner.port = Some(port);
-    }
-
-    // The child reads the password from the environment we set above; Piko
-    // reads it back from here. Nothing is printed.
-    secrets::set("opencode-url", &url)?;
-    secrets::set("opencode-password", &password)?;
-
-    let c = Conn {
-        url: url.clone(),
-        user: DEFAULT_USER.into(),
-        pass: Some(password),
-    };
-    match await_healthy(&url, &c).await {
-        Some(version) => {
-            log::line(&format!(
-                "opencode managed server up on port {port} ({version})"
-            ));
-            Ok(version)
-        }
-        None => Err("the server did not become healthy".into()),
-    }
-}
-
-/// The shared handle, cloned into the supervisor thread so it can outlive the
-/// borrow a Tauri command has.
-fn managed(app: &AppHandle) -> std::sync::Arc<Managed> {
-    app.state::<std::sync::Arc<Managed>>().inner().clone()
-}
-
-/// Called once from `setup`. Spawns the supervisor, which is also what makes a
-/// restart after a crash possible.
-pub fn start_managed(app: AppHandle) {
-    let m = managed(&app);
-    // Switching it off and on again has to bring the watcher back: `stop_managed`
-    // latched `stopping`, and a supervisor that saw the latch would walk away for
-    // good and leave a crash unsupervised from then on.
-    m.stopping
-        .store(false, std::sync::atomic::Ordering::Relaxed);
-    tauri::async_runtime::spawn({
-        let app = app.clone();
-        async move {
-            ensure(&app).await;
-        }
-    });
-    if m.supervising
-        .swap(true, std::sync::atomic::Ordering::SeqCst)
-    {
-        return; // already watching
-    }
-    std::thread::spawn(move || supervise(m));
-}
-
-/// Make sure a server is there, without starting a second one. Safe to call from
-/// several places.
-pub async fn ensure(app: &AppHandle) {
-    if !crate::settings::load().managed_server {
-        return;
-    }
-    // Something already answers at the configured URL - a server the user runs
-    // themselves, or ours from last time - so leave it alone.
     let c = conn();
-    if probe(&c.url, &c).await.is_some() {
-        return;
+    let Some(port) = port_of(&c.url) else {
+        return Err(format!(
+            "{} has no port in it, so there is nowhere to start OpenCode",
+            c.url
+        ));
+    };
+    log::line(&format!("starting `opencode serve` on port {port}"));
+    let child = spawn_server(&cli, port).map_err(|e| format!("could not start it: {e}"))?;
+    *owned().lock().unwrap() = Some(child);
+
+    // A process that started is not a server that works: poll health until it says
+    // so, and give the port back if it never does.
+    let mut waited = Duration::ZERO;
+    let mut step = 150u64;
+    while waited < START_WAIT {
+        tokio::time::sleep(Duration::from_millis(step)).await;
+        waited += Duration::from_millis(step);
+        step = (step * 2).min(1_000);
+        let h = health().await;
+        if h.ok {
+            return Ok(h.version.unwrap_or_else(|| "?".into()));
+        }
     }
-    let m = managed(app);
-    if m.inner.lock().unwrap().child.is_some() {
-        return;
-    }
-    if let Err(e) = launch(&m).await {
-        log::line(&format!("opencode managed server: {e}"));
-    }
+    let _ = owned().lock().unwrap().take();
+    log::line("`opencode serve` started but never became healthy");
+    Err(format!(
+        "started OpenCode but it never answered on port {port}"
+    ))
 }
 
-/// Watches the child and brings it back if it dies. Three goes, then it stops
-/// asking: something restarting forever is worse than a clear failure.
-fn supervise(m: std::sync::Arc<Managed>) {
-    // This is a plain thread, not an async task, but the health gate is written
-    // against reqwest. One current-thread runtime for the thread's whole life is
-    // cheaper than a runtime per restart, and restarts are rare anyway.
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .ok();
-    loop {
-        std::thread::sleep(Duration::from_secs(2));
-        if m.stopping.load(std::sync::atomic::Ordering::Relaxed) {
-            m.supervising
-                .store(false, std::sync::atomic::Ordering::SeqCst);
-            return;
-        }
-        let mut inner = m.inner.lock().unwrap();
-        let Some(child) = inner.child.as_mut() else {
-            continue;
-        };
-        let gone = match child.try_wait() {
-            // Still running.
-            Ok(None) => continue,
-            Ok(Some(_)) | Err(_) => true,
-        };
-        if !gone {
-            continue;
-        }
-        let tries = m
-            .restarts
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        inner.child = None;
-        // Its job died with it; keeping the handle would only leak it.
-        inner.job = None;
-        if tries >= MAX_RESTARTS {
-            log::line("opencode managed server kept falling over - not restarting it again");
-            m.supervising
-                .store(false, std::sync::atomic::Ordering::SeqCst);
-            return;
-        }
-        log::line("opencode managed server exited - restarting");
-        drop(inner);
-        let was = conn().url;
-        let Some(password) = m.inner.lock().unwrap().password.clone() else {
-            m.supervising
-                .store(false, std::sync::atomic::Ordering::SeqCst);
-            return;
-        };
-        let Some(port) = free_port() else { continue };
-        let Some(cli) = cli() else {
-            m.supervising
-                .store(false, std::sync::atomic::Ordering::SeqCst);
-            return;
-        };
-        let Ok(child) = spawn_server(&cli, port, &password) else {
-            log::line("opencode managed server would not restart");
-            continue;
-        };
-        let job = KillOnDrop::new_with(&child);
-        let url = format!("http://127.0.0.1:{port}");
-        {
-            let mut inner = m.inner.lock().unwrap();
-            inner.child = Some(child);
-            inner.job = job;
-            inner.port = Some(port);
-        }
-        let _ = secrets::set("opencode-url", &url);
-        let c = Conn {
-            url: url.clone(),
-            user: DEFAULT_USER.into(),
-            pass: Some(password),
-        };
-        // A process that starts is not a server that works. Same health gate as
-        // the first launch, otherwise a restart that binds and then crashes
-        // leaves Piko pointed at nothing while the log claims success.
-        match rt
-            .as_ref()
-            .and_then(|rt| rt.block_on(await_healthy(&url, &c)))
-        {
-            Some(version) => log::line(&format!(
-                "opencode managed server back on port {port} ({version}), was {was}"
-            )),
-            None => {
-                log::line("opencode managed server restarted but never became healthy");
-                // Taking the job with it kills the tree even if `wait` would not.
-                let mut inner = m.inner.lock().unwrap();
-                let _ = inner.job.take();
-                let _ = inner.child.take();
+/// Whether the island wants the reconnect loop running. Set from the chat room.
+static RECONNECT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// One loop at a time, so a second request joins the one already running instead of
+/// starting a rival that doubles every probe.
+static RECONNECTING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Emits the connection status the island renders.
+fn emit_status(app: &AppHandle, h: &Health) {
+    let _ = app.emit_to(WINDOW_LABEL, "opencode-status", h);
+}
+
+/// Keeps trying to reach OpenCode, with the delay doubling up to half a minute.
+///
+/// Started when the chat room opens and stopped when it closes, because that is
+/// the only time a connection the island cannot see is worth anything: a room that
+/// is closed cannot be sending a turn that failed. Ends the moment health passes —
+/// the person can see it connected, and a loop that kept going would be a request
+/// every thirty seconds forever for no reason. The island re-arms it on the next
+/// failure.
+pub fn watch(app: AppHandle, on: bool) {
+    RECONNECT.store(on, std::sync::atomic::Ordering::Relaxed);
+    if !on {
+        return;
+    }
+    if RECONNECTING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return; // one is already on its way
+    }
+    tauri::async_runtime::spawn(async move {
+        let mut delay = 1u64;
+        loop {
+            if !RECONNECT.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
             }
+            let h = health().await;
+            emit_status(&app, &h);
+            if h.ok {
+                break;
+            }
+            if !sleep_unless_stopped(delay).await {
+                break;
+            }
+            delay = (delay * 2).min(30);
         }
-    }
+        RECONNECTING.store(false, std::sync::atomic::Ordering::SeqCst);
+    });
 }
 
-/// Settings turned managed mode off: stop the child we started and leave the
-/// stored URL alone for the manual path to use.
-pub fn stop_managed(app: &AppHandle) {
-    let m = managed(app);
-    m.stopping.store(true, std::sync::atomic::Ordering::Relaxed);
-    let mut inner = m.inner.lock().unwrap();
-    if let Some(mut child) = inner.child.take() {
-        kill_tree(child.id());
-        let _ = child.wait();
-        // Belt and braces: the job handle is the part that works when the next
-        // quit is not a cooperative one, and there is nothing to lose by closing
-        // it here too.
-        let _ = inner.job.take();
-        log::line("opencode managed server stopped");
+/// Sleeps in slices, so a stop request is never stuck behind a thirty-second nap.
+///
+/// Returns false when the caller should give up — either the island stopped asking
+/// or the loop that was waiting has been superseded.
+async fn sleep_unless_stopped(seconds: u64) -> bool {
+    let mut left = Duration::from_secs(seconds);
+    let slice = Duration::from_millis(200);
+    while !left.is_zero() {
+        if !RECONNECT.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
+        let step = left.min(slice);
+        tokio::time::sleep(step).await;
+        left -= step;
     }
-    inner.port = None;
-}
-
-/// App exit. `kill` then `wait`, so the port is released before Piko goes and
-/// the next launch can have it again.
-pub fn shutdown_managed(app: &AppHandle) {
-    let m = managed(app);
-    m.stopping.store(true, std::sync::atomic::Ordering::Relaxed);
-    let mut inner = m.inner.lock().unwrap();
-    if let Some(mut child) = inner.child.take() {
-        kill_tree(child.id());
-        let _ = child.wait();
-    }
-    // Dropping this is what actually guarantees the server is gone, including
-    // when Piko is killed instead of closed and this never runs at all.
-    let _ = inner.job.take();
+    RECONNECT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[cfg(test)]
@@ -1889,36 +1728,73 @@ mod tests {
     }
 
     #[test]
-    fn the_generated_password_is_long_and_boring_to_print() {
-        // 48 characters over an alphabet with nothing needing an escape: it has
-        // to survive being an environment variable on someone else's launcher.
-        let pw = random_password().expect("csprng");
-        assert_eq!(pw.len(), 48);
-        assert!(pw.chars().all(|c| c.is_ascii_alphanumeric()), "{pw}");
-        // Two draws should not collide; a CSPRNG that repeats is not one.
-        assert_ne!(pw, random_password().unwrap());
-    }
-
-    #[test]
-    fn a_free_port_is_a_port() {
-        let port = free_port().expect("a free port");
-        assert!(port > 0);
-    }
-
-    #[test]
-    fn managed_server_is_the_default_and_an_older_settings_file_says_so() {
-        // A settings.json written before this flag existed must come back with it
-        // on, or every existing install silently drops into manual mode on the
-        // first launch after updating.
+    fn a_settings_file_from_the_managed_era_still_loads() {
+        // Every install on disk has `managedServer` in it. The field is gone, so
+        // the key has to be ignored rather than rejected — otherwise the first
+        // launch after this change fails to parse the file and Piko starts with
+        // defaults, which is a worse outcome than ignoring an obsolete switch.
         let older = r#"{
             "soundEnabled": true, "soundVolume": 0.12,
             "autoCloseInterval": 15.0, "absenceInterval": 180.0,
             "activeIntegrations": [], "screen": "primary",
-            "autostart": false, "hooksInstalled": false, "model": "opencode"
+            "autostart": false, "hooksInstalled": false, "model": "opencode",
+            "managedServer": true, "taskAgent": "build", "chatAgent": "plan"
         }"#;
-        let parsed: Settings = serde_json::from_str(older).expect("an older settings file");
-        assert!(parsed.managed_server);
-        assert!(Settings::default().managed_server);
+        let parsed: Settings = serde_json::from_str(older).expect("a managed-era settings file");
+        // The parts that are still ours survive the obsolete key.
+        assert_eq!(parsed.task_agent, "build");
+        assert_eq!(parsed.chat_agent, "plan");
+        assert_eq!(parsed.sound_volume, 0.12);
+        // And the key itself is read, because it is the only thing that says the
+        // stored URL belongs to a server Piko started.
+        assert_eq!(parsed.managed_server, Some(true));
+    }
+
+    #[test]
+    fn a_manual_install_is_never_mistaken_for_a_managed_one() {
+        // `Some(false)` is somebody who already pointed Piko at their own server:
+        // that URL is theirs and must survive untouched, so the migration has to
+        // tell the two apart rather than treat any old settings file as managed.
+        let manual = r#"{
+            "soundEnabled": true, "soundVolume": 0.5,
+            "autoCloseInterval": 15.0, "absenceInterval": 180.0,
+            "activeIntegrations": [], "screen": "primary",
+            "autostart": false, "hooksInstalled": false, "model": "opencode",
+            "managedServer": false
+        }"#;
+        let parsed: Settings = serde_json::from_str(manual).expect("a manual-era settings file");
+        assert_eq!(parsed.managed_server, Some(false));
+    }
+
+    #[test]
+    fn the_port_to_start_on_comes_out_of_the_configured_url() {
+        // The one source of truth for the port is the URL itself, so a URL and a
+        // separately stored port cannot disagree about where the server goes.
+        assert_eq!(port_of("http://127.0.0.1:4096"), Some(4096));
+        assert_eq!(port_of("http://localhost:1234/"), Some(1234));
+        // No port, no scheme, nonsense: refused rather than guessed, because
+        // guessing here means starting a server somewhere nobody is looking.
+        assert_eq!(port_of("http://127.0.0.1"), None);
+        assert_eq!(port_of("127.0.0.1:4096"), None);
+        assert_eq!(port_of("http://127.0.0.1:0"), None);
+        assert_eq!(port_of(""), None);
+    }
+
+    #[test]
+    fn the_managed_flag_is_not_written_back_out() {
+        // One shot. If the key survived a save, the migration would run on every
+        // launch and keep clearing a URL the person had since saved by hand —
+        // the one way this could become destructive.
+        let mut settings = Settings::default();
+        settings.managed_server = Some(true);
+        let json = serde_json::to_string(&settings).expect("settings serialise");
+        assert!(
+            !json.contains("managedServer"),
+            "the migration marker leaked into settings.json: {json}"
+        );
+        // And a file without it reads back as "no opinion", which is what a fresh
+        // install and every manual one now look like.
+        assert_eq!(Settings::default().managed_server, None);
     }
 
     #[test]

@@ -108,12 +108,30 @@ export const Bridge = {
 
   openUrl: (url: string) => call<void>("open_url", { url }),
 
-  /** "Open terminal" → opens the folder in VS Code when `code` is on PATH. */
+  /** The old single-target button. Kept for the finished/error cards. */
   openInVSCode: (path: string | null) => call<boolean>("open_in_vscode", { path }),
+
+  /**
+   * What this machine can open a folder in, right now.
+   *
+   * Asked for when the menu is built rather than cached at startup: a machine
+   * gains VS Code or the OpenCode app by installing it, and a list captured at
+   * launch would quietly lie about it afterwards.
+   */
+  openTargets: () => call<OpenTarget[]>("open_targets"),
+
+  /**
+   * Opens a folder in one of those. `path` may be null, in which case Rust uses
+   * the last project a task ran in and refuses when there is none — there is no
+   * hidden default directory to fall back on.
+   */
+  openIn: (target: string, path: string | null) => callOrThrow<string>("open_in", { target, path }),
 
   quit: () => call<void>("quit_app"),
 
   openSettingsWindow: () => call<void>("open_settings_window"),
+  /** Hides the settings window — what its close button does, and what Escape now does. */
+  closeSettingsWindow: () => call<void>("close_settings_window"),
 
   /** Writes to %LOCALAPPDATA%\Piko\piko.log, next to the Rust lines. */
   log: (message: string) => call<void>("log_line", { message }),
@@ -142,8 +160,36 @@ export const Bridge = {
    * what broke — which is exactly when the person watching wants to stop it.
    */
   chatStop: () => callOrThrow<void>("chat_stop"),
-  opencodeTest: () => callOrThrow<string>("opencode_test"),
-  opencodeDetect: () => call<string | null>("opencode_detect"),
+opencodeTest: () => callOrThrow<string>("opencode_test"),
+opencodeDetect: () => call<string | null>("opencode_detect"),
+
+  // ── Connection ────────────────────────────────────────────────────────────────
+
+  /**
+   * One health check against the configured address.
+   *
+   * Answers even when nothing is running, which is what makes it usable as a
+   * status line and as the Retry: `opencode_test` fails instead, so it can only
+   * ever be the answer to "does it work" and never the answer to "why not".
+   */
+  opencodeHealth: () => callOrThrow<OpenCodeHealth>("opencode_health"),
+
+  /**
+   * Starts an OpenCode on the configured port, and waits for it to answer.
+   *
+   * A server already at that address is left alone rather than joined by a second
+   * one, and only a server this started is stopped when Piko exits.
+   */
+  opencodeStart: () => callOrThrow<string>("opencode_start"),
+
+  /**
+   * Keeps (or stops) the background reconnect loop.
+   *
+   * Started while the chat room is open, because that is the only time a connection
+   * the island cannot see is worth anything. One loop runs at a time however many
+   * times this is called with `true`.
+   */
+  opencodeWatch: (on: boolean) => call<void>("opencode_watch", { on }),
   /** Copies a dropped file into the inbox. */
   ingestFile: (path: string) => callOrThrow<DroppedFile>("ingest_file", { path }),
   /** Only ever tells you whether a key exists — never its value. */
@@ -216,6 +262,28 @@ export interface IslandGeometry {
   monY: number;
   monW: number;
   monH: number;
+}
+
+/** `lib.rs::OpenTarget` — one place this machine can open a project folder in. */
+export interface OpenTarget {
+  id: "vscode" | "opencode-app" | "opencode-cli";
+  label: string;
+}
+
+/**
+ * `opencode.rs::Health` — one health check's answer.
+ *
+ * `ok: false` is not an error here: "nothing is answering, and here is why" is the
+ * thing the island needs to show, so it comes back as a value rather than a
+ * rejection. `reason` is the short form; the full reqwest chain is in the log.
+ */
+export interface OpenCodeHealth {
+  ok: boolean;
+  url: string;
+  version?: string;
+  reason?: string;
+  /** The `opencode` program is not installed at all. */
+  cliMissing: boolean;
 }
 
 /** `mcpserver::Status`, serialised camelCase. */

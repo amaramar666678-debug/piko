@@ -1,0 +1,26 @@
+<!--
+  Piko — concept C: "Dome"
+  A half-disc with a flat base and two eyes: the shape the island actually is when it
+  slides back into the top edge of the screen. The flat bottom is the whole idea — it
+  is the only one of the three that is not a closed blob, so it does not sit in the
+  same family as any rounded-square app icon, and it still reads at 16px.
+
+  The eyes are cut with a <mask>: a cut that meets the outline has to subtract, and
+  evenodd would XOR it instead.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <mask id="c-cut" maskUnits="userSpaceOnUse" x="0" y="0" width="512" height="512">
+      <rect width="512" height="512" fill="#FFFFFF"/>
+      <circle cx="196" cy="268" r="32" fill="#000000"/>
+      <circle cx="316" cy="268" r="32" fill="#000000"/>
+    </mask>
+  </defs>
+
+  <path fill="#FFFFFF" mask="url(#c-cut)" d="
+    M80,340
+    A176,176 0 0 1 432,340
+    L80,340
+    Z
+  "/>
+</svg>
